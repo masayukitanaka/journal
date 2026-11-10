@@ -1,9 +1,19 @@
+import type { FieldInfo } from "../api";
+
 interface HeaderProps {
 	isSample: boolean;
+	availableFields: FieldInfo[];
+	field: number;
+	onFieldChange: (field: number) => void;
+	yearRange: string | undefined;
+	onYearRangeChange: (yearRange: string | undefined) => void;
 }
 
-// SPEC.md 6.1: ヘッダー（タイトル、注意書き（サンプル表示時）、凡例（ハブ・非ハブ）。
-export function Header({ isSample }: HeaderProps) {
+// SPEC.md 6.1: ヘッダー（タイトル、注意書き（サンプル表示時）、凡例（ハブ・非ハブ）、分野・年代の切り替え）。
+export function Header({ isSample, availableFields, field, onFieldChange, yearRange, onYearRangeChange }: HeaderProps) {
+	const currentField = availableFields.find((f) => f.field === field);
+	const yearRanges = currentField?.yearRanges ?? [];
+
 	return (
 		<header
 			style={{
@@ -16,7 +26,46 @@ export function Header({ isSample }: HeaderProps) {
 				background: "var(--surface)",
 			}}
 		>
-			<h1 style={{ fontSize: 16, fontWeight: 650, margin: 0, letterSpacing: -0.2 }}>Citation Phylogeny — Computer Science</h1>
+			<h1 style={{ fontSize: 16, fontWeight: 650, margin: 0, letterSpacing: -0.2 }}>Citation Phylogeny</h1>
+
+			<label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }} title="Switch the field (each field is backed by its own database)">
+				<select
+					className="ctl-select"
+					value={field}
+					onChange={(e) => {
+						onFieldChange(Number(e.target.value));
+						onYearRangeChange(undefined);
+					}}
+					disabled={availableFields.length === 0}
+				>
+					{availableFields.length === 0 ? (
+						<option value={field}>{currentField?.name ?? `Field ${field}`}</option>
+					) : (
+						availableFields.map((f) => (
+							<option key={f.field} value={f.field}>
+								{f.name}
+							</option>
+						))
+					)}
+				</select>
+			</label>
+
+			{yearRanges.length > 0 && (
+				<label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }} title="Switch the year range (each range is backed by its own database)">
+					<select
+						className="ctl-select"
+						value={yearRange ?? yearRanges[0]}
+						onChange={(e) => onYearRangeChange(e.target.value)}
+					>
+						{yearRanges.map((yr) => (
+							<option key={yr} value={yr}>
+								{yr}
+							</option>
+						))}
+					</select>
+				</label>
+			)}
+
 			{isSample && (
 				<span style={{ fontSize: 12, color: "var(--warn-text)", background: "var(--warn-bg)", padding: "3px 10px", borderRadius: 999 }}>
 					Showing sample data (API not connected)

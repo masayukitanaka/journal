@@ -38,7 +38,9 @@
 	 */
 	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
 	/**
-	 * D1 Database — 分野 17（計算機科学）・2016〜2026 年の論文・引用エッジ（SPEC.md 4.4, ARCHITECT.md 3.4）
+	 * D1 Database — 分野・年代ごとの論文・引用エッジ（SPEC.md 4.4, ARCHITECT.md 3.4）。
+	 * 命名規則: binding は DB_FIELD{分野ID}_{開始年}_{終了年}。新しい分野・年代レンジを追加する際は、
+	 * ここに binding を追加した上で worker/db.ts の DB_REGISTRY にも 1 行追加する（2026-11-10）。
 	 * https://developers.cloudflare.com/d1/
 	 * remote: true により、ローカル開発（vite dev）でも本番 D1 を直接参照する（ローカル D1 は P1 のテスト後に空のまま）。
 	 * https://developers.cloudflare.com/workers/vite-plugin/reference/remote-bindings/

@@ -12,7 +12,7 @@
 
 ### P0-1. OpenAlex 利用準備
 - [x] OpenAlex の無料 API キーを取得する（ARCHITECT 7-1, 7-3）— 取得済み。`.dev.vars` の `OPENALEX_API_KEY` に設定済み（gitignore 対象、`.dev.vars.example` に雛形を追加済み）。API 呼び出しで有効性を確認済み（2026-11-09、`meta.count` が無認証時と一致）
-- [ ] API キーの日次バジェット・秒間レート（無料キー 30 req/s の実際の挙動）を小規模リクエストで確認する — P1 の Rate Limiter DO 実装時に実施
+- [ ] API キーの日次バジェット・秒間レート（無料キー 30 req/s の実際の挙動）を小規模リクエストで確認する — Rate Limiter DO 自体は P1-2 で実装済み。日次バジェットの実測は P1-7（日次差分更新）の本番運用開始後に実施
 - [x] `primary_topic.field.id:17` でのフィルタが意図通りの件数を返すことを `meta.count` で確認する（分野 17 = 計算機科学）— 2026-11-09 実測: 全年代 12,266,119 件、2016〜2026年 6,095,841 件、2016年単年 426,794 件、2024年単年 618,966 件
 - [x] 年範囲フィルタの構文を確認する — `publication_year:2016-2026` のハイフン範囲構文は実測では動作するが公式ドキュメント未記載。`from_publication_date:2016-01-01,to_publication_date:2026-12-31`（公式に明記された構文）で同じ件数を確認。**後者を正式採用**（ARCHITECT 3.1 に反映済み）
 - [x] `fwci` など使用予定フィルタ・フィールド名を OpenAlex の公式ドキュメントで確認する（SPEC 8 章「数値の確認」）— `fwci`（Float、Field-weighted Citation Impact = 出版年+3年分の被引用数/期待値の比）を GitHub 公式ドキュメントで確認済み。SPEC 4.4 に反映済み
@@ -41,9 +41,63 @@
 
 ---
 
-## P1: Ingest Workflow による取り込み（分野 17・直近 10 年）
+## P1: 初期インポート（S3 スナップショット）+ Ingest Workflow（日次差分更新）
 
 完了条件: 件数・`child_cnt` が検証できること（SPEC 9 章の検証項目、ARCHITECT 8 章）。
+
+**方針変更（2026-11-10）**: 当初は Ingest Workflow（API cursor paging）で初期取り込みも行う計画だったが、直近10年・Field 17 で約609万件・約30,500ページかかり Workflows のステップ数上限を超えるため、N=50,000件（被引用上位のみ）に絞って PoC を開始した（下記 P1-1〜P1-5 は当時の実績）。系統樹として裾野まで含めた引用構造を再現するため、**初期インポートは S3 スナップショットからの一括取り込みに切り替え、Ingest Workflow は日次差分更新に専念させる**方針に変更した（詳細: [docs/ARCHITECT.md](./ARCHITECT.md) 3.1・3.1.1、[docs/init-ingest.md](./init-ingest.md)）。
+
+### P1-0. 初期インポート（S3 スナップショットからの一括取り込み、新方針）
+
+完了条件: 分野17・直近10年の全件規模（約609万件）が D1 に投入され、`child_cnt` が検証できること。**小規模検証 → 中規模実行 → 本番実行の段階を踏む**（詳細手順・各段階の完了条件は [docs/init-ingest.md](./init-ingest.md) 3章・3.0）。
+
+#### P1-0-①. 抽出スクリプトの動作確認（小規模）
+- [ ] `extract_cs.py` を拡張する — `--pattern` に S3 URL（`s3://openalex/data/parquet/works/*/*.parquet`）を渡せるようにし、httpfs 拡張のロード・`s3_region` 設定を追加する（init-ingest.md 3.2）
+- [ ] `extract_cs.py` の抽出列を D1 スキーマ（migrations 0001-0003）に合わせて拡張する — 現状 `papers.csv` は `id, title, year, cit, field` のみで、`publication_date`（月精度の `year`）・`fwci`・`subfield`・`doi` が欠けている（init-ingest.md 3.3）
+- [ ] `extract_cs.py` に `keywords`/`paper_keywords` の抽出を追加する — `UNNEST` で `STRUCT(id, display_name, score)[]` を展開し、`keywords`（辞書: id, name）と `paper_keywords`（中間テーブル: paper_id, keyword_id, score）を生成する（init-ingest.md 3.3、migrations/0005）
+- [ ] `--limit-files 1`（または数ファイル）+ S3 URL で実行し、httpfs 経由で正しく S3 から読めること、拡張した列（`keywords`/`paper_keywords` 含む）が期待通り出力されることを確認する
+
+#### P1-0-②. 小規模 D1 投入の確認
+- [ ] D1 投入方式を仮決定する — `wrangler d1 execute --file`（SQLite dump 生成）か、R2 経由 + Worker チャンク投入のどちらかを試す（init-ingest.md 3.4）
+- [ ] テスト用の投入先（本番 D1 に投入して後で削除するか、検証用 D1 を別途作るか）を決める（init-ingest.md 5章 未確定事項7）
+- [ ] ①の小規模出力（数千件規模）を `papers` → `edges` → `child_cnt` 再計算 → `keywords`/`paper_keywords` の順に投入する
+- [ ] 件数一致・`child_cnt` 不一致 0 件を確認する（init-ingest.md 3.6 と同じ検証を小規模データで実施）
+- [ ] `paper_keywords.keyword_id` が `keywords.id` に存在すること、`paper_keywords.paper_id` が `papers.id` に存在することを確認する（init-ingest.md 3.6）
+- [ ] テスト用に投入したデータを後始末する（本番 D1 を使った場合は削除、検証用 D1 を使った場合は保持または破棄）
+
+#### P1-0-③. 一部分野・一部年代での中規模実行
+- [ ] 分野17・直近1〜2年分など、本番の一部を対象に `--min-year` を絞って抽出する
+- [ ] `--count` で絞り込み後件数を確認する
+- [ ] ②で確認した D1 投入方式で中規模データを投入し、処理時間・D1サイズ・エッジ密度を実測する（`paper_keywords` の行数・サイズも含む）
+- [ ] 実測結果から、本番実行（④）をローカル PC で続けるか EC2 に切り替えるかを判断する（init-ingest.md 2.1）
+- [ ] ARCHITECT.md 3.4.1 の容量試算との比較を参考値として記録する（`paper_keywords` 分も加味）
+- [ ] 中規模テストデータを後始末する（②と同様）
+
+#### P1-0-④. 本番実行（全件）
+- [ ] 実行場所を確定する（③の判断に基づき、ローカル PC または EC2）。EC2 の場合はセットアップを行う（init-ingest.md 3.5）
+- [ ] 本番実行: 分野17・直近10年の全件で `papers`/`edges`/`child_cnt`/`keywords`/`paper_keywords` を抽出する（`--count` で P0-1 実測の約609万件と大きく外れないか確認）
+- [ ] `papers` → `edges`（`cited` 側が `papers` に存在するものだけ） → `child_cnt` 再計算 → `keywords`/`paper_keywords`、の順序で D1 へ投入する
+- [ ] 投入後、件数が抽出時点と一致すること、`child_cnt` が `recomputeChildCnt` と同じロジックで不一致 0 件であること、`paper_keywords` の整合性（keyword_id/paper_id の存在）を検証する（init-ingest.md 3.6）
+- [ ] ARCHITECT.md 3.4.1 の容量試算（直近10年全件で約6〜9GB）と実測値を比較し、年代分割（3.4.2）着手の要否を判断する
+- [ ] （EC2 を使った場合）作業完了後、インスタンスを確実に終了（Terminate）したことを確認する
+
+### P1-7. Ingest Workflow を日次差分更新に変更する（新方針）
+
+完了条件: `from_updated_date` ベースの差分取得が動作し、初期インポート後の継続運用に利用できること。詳細は [docs/ARCHITECT.md](./ARCHITECT.md) 3.1.1、[docs/init-ingest.md](./init-ingest.md) 4章。
+
+- [ ] `ingest_state` テーブルを追加するマイグレーションを作成する（`key TEXT PRIMARY KEY, value TEXT`、`key='last_updated_date'` で前回実行日を記録）
+- [ ] `worker/openalex-client.ts` の `fetchWorksPage` に `fromUpdatedDate` パラメータを追加する
+- [ ] `worker/ingest-workflow.ts` を変更する — `MAX_PAGES=250`（N=50,000件固定）の制約を撤廃し、`filter=...,from_updated_date:{last_run}` ベースの差分取得に変更。`sort=cited_by_count:desc` も不要になる（全件扱いのため）
+- [ ] Workflow の最終ステップで `ingest_state.last_updated_date` を更新するロジックを追加する
+- [ ] 初期値（`last_updated_date` の初期値）を、初期インポートに使ったスナップショットの `date`（`data/openalex/manifest.json` の `date` フィールド、現状 `2026-10-14`）に設定する
+- [ ] 1日あたりの更新件数・ページ数を実測し、Workflows のステップ数上限に対して十分な余裕があるか確認する
+- [ ] 差分更新の `upsert-edges` が、初期インポート分 + これまでの差分分を含む既存 `papers` に対して正しく判定できることを確認する
+
+---
+
+## 旧方針の実績（履歴、API cursor paging による N=50,000件への絞り込み）
+
+以下の P1-1〜P1-5 は、上記方針変更前（2026-11-09 時点）に Ingest Workflow（API cursor paging、N=50,000件）で初期取り込みを行った際の実績記録。コード資産（D1スキーマ、Rate Limiter DO、OpenAlex クライアント）は新方針でも再利用するため記録を残す。P1-3 の Workflow 実装は P1-7 で日次差分専用に変更する。P1-6（Semantic Scholar 連携）はこの履歴ブロック内の番号で、新設の P1-0・P1-7 とは独立した別タスク。
 
 ### P1-1. D1 スキーマの実装
 - [x] `papers` テーブルのマイグレーションを作成する（SPEC 4.4 準拠）— `migrations/0001_create_papers_and_edges_tables.sql`
@@ -254,12 +308,37 @@
 
 ### 既知の暫定措置（要クリーンアップ）
 
-- **D1（papers/edges）が本番・ローカルとも 0 件になっている**（2026-11-10 時点で確認。原因未調査）。P1 の再取り込みで解消される想定。
-- **R2 の `graph/field17/seed-2194775991-d2.json`（本番・ローカル両方）に、月単位レイアウト（X軸の月グリッド化）の見た目確認用として、`year` を手動で `year + ランダムな月/12` に書き換えたテストデータが入っている**（2026-11-10）。実際の OpenAlex 由来データではないため、このファイルを見ている間は分岐数・被引用数は正しいが出版年月が不正確。次回 Ingest Workflow 実行後、Graph Builder が同じシード・depth のグラフを再生成すれば自動的に上書きされ解消する。それまでは本番サイトでこのシード（Deep Residual Learning, id=2194775991, depth=2）を表示すると不正確な月が見える点に注意。
-- **本番 D1（`field17_2016_2026`）の `papers`/`edges` に、外部リンク機能（OpenAlex/DOI）の動作確認用テストデータ 3 件を手動投入している**（2026-11-10、id=2194775991 Deep Residual Learning, 2163605009 ImageNet classification, 639708223 Faster R-CNN。`doi` 列・`child_cnt` は概算値で実際の値とは異なる）。実際の OpenAlex データではないため、次回 Ingest Workflow 実行時に `ON CONFLICT` で正しい値に上書きされる想定。それまでは本番の `/api/fields/17/top` 等にこの3件が混じって見える。
+- **D1（papers/edges）が本番・ローカルとも 0 件になっている**（2026-11-10 時点で確認。原因未調査）。**方針変更（P1-0）** により、解消は次回の Ingest Workflow 実行ではなく、S3 スナップショットからの初期インポート（P1-0）の完了を待つことになった。
+- **R2 の `graph/field17/seed-2194775991-d2.json`（本番・ローカル両方）に、月単位レイアウト（X軸の月グリッド化）の見た目確認用として、`year` を手動で `year + ランダムな月/12` に書き換えたテストデータが入っている**（2026-11-10）。実際の OpenAlex 由来データではないため、このファイルを見ている間は分岐数・被引用数は正しいが出版年月が不正確。**方針変更（P1-0）** により、解消タイミングは初期インポート完了後に Graph Builder が同じシード・depth のグラフを再生成した時点になる。それまでは本番サイトでこのシード（Deep Residual Learning, id=2194775991, depth=2）を表示すると不正確な月が見える点に注意。
+- **本番 D1（`field17_2016_2026`）の `papers`/`edges` に、外部リンク機能（OpenAlex/DOI）の動作確認用テストデータ 3 件を手動投入している**（2026-11-10、id=2194775991 Deep Residual Learning, 2163605009 ImageNet classification, 639708223 Faster R-CNN。`doi` 列・`child_cnt` は概算値で実際の値とは異なる）。実際の OpenAlex データではないため、**方針変更（P1-0）** により、初期インポート（S3スナップショット由来）投入時に `ON CONFLICT` で正しい値に上書きされる想定。それまでは本番の `/api/fields/17/top` 等にこの3件が混じって見える。
 
 ### UI 整理（2026-11-10）
 
 - **「最多被引用へ」ボタンを撤去**した。円の大きさ（対数スケール、分岐数に比例）で被引用上位がひと目で分かるため不要と判断。被引用 1 位へは、サイドパネルの「被引用の上位」一覧の先頭項目クリックで引き続き到達できる。SPEC.md 6.1/6.4 から該当記述を削除し注記を追加済み。tasks.md 上記の過去の実績記録（P3-4, P3-7 など）は履歴としてそのまま残す。
 - **「ハブの基準」の表示連動バグを修正 → その後 UI ごと撤去**: 当初、ツールチップの「ハブ」表示が操作バーの「ハブの基準」とは無関係にハードコードされた `4` で判定されていたバグを修正し、`GraphView` に `hubMinChild` を渡して `filters.ts` の `isHub()` で統一判定するようにした。しかしユーザーが実際に基準を極端な値（例: 54321989）に変えても「円の色・大きさが変わらない」と報告。円の色・大きさは分岐数の連続値で決まる設計（骨格のみの絞り込みとツールチップの「ハブ」表示にしか基準が反映されない）のため、変更しても見た目の変化が分かりにくいことが根本原因と判明。色・大きさを連続表現のまま維持する方針を優先し、「ハブの基準」の調整 UI 自体を撤去。`isHub()` はデフォルト引数 `HUB_MIN_CHILD_DEFAULT = 4`（`filters.ts`）を使う固定値判定に戻した。サイドパネルの「ハブ上位 10 件」一覧の再取得（`hubMinChild` 変更時）ロジックも不要になり削除。
 - **「骨格のみ」「表示件数」の各ラベルに `title` 属性で説明文を追加**し、ホバーで機能の意図が分かるようにした。
+
+### UI 英語化（2026-11-10）
+
+- **画面表示文言をすべて英語化**した（コメントは日本語のまま）。`index.html` のタイトル、`Header`/`OperationBar`/`SidePanel`/`GraphView` のツールチップ・ボタン・見出し・プレースホルダー、`sampleData.ts` のサンプル論文名。`layout.ts` の `formatYearMonth` を `"Jun 2016"` 形式に変更し、新たに `formatChildCount`/`formatCitationCount` を追加して "1 child"/"2 children"、"1 citation"/"2 citations" の単数・複数形を正しく出し分けるようにした。言語切り替え機能は追加していない（固定で英語）。
+
+### 著者名検索（2026-11-10、検索まわりのみ先行実装）
+
+- **方針**: ingest は S3 からのインポート方式で作り直す予定のため、ingest・スキーマへの実データ投入はまだ行わない。検索 API・フロントエンドのみ、将来 `authorships` テーブルが埋まる前提で先行実装した。
+- **`migrations/0004_create_authorships_table.sql`** を追加（`authorships(paper_id, author_name)`、正規化・複合PKなし）。ローカル・本番両方に適用済み（テーブルは空）。
+- **`worker/api/search.ts`** を `papers LEFT JOIN authorships` + `WHERE title LIKE ? OR author_name LIKE ?` に変更。1論文に複数著者がマッチして重複行が出るのを防ぐため `SELECT DISTINCT` を使用。`authorships` が空の間もタイトル検索は従来通り動作することを確認済み。
+- **`SidePanel.tsx`** の検索ボックスのプレースホルダーを `"Title or author name..."` に変更。
+- **動作確認**: 本番・ローカル両 D1 に `Kaiming He`/`Xiangyu Zhang`（論文 id=2194775991 向け）のテスト著者行を投入し、著者名検索・タイトル検索ともにヒットし重複も出ないことをブラウザ実機で確認した。**このテスト著者データは本番 D1 に残したまま**にしている（実際の論文の実際の著者名であり実害はない）。S3 ingest 実装時に `authorships` テーブル全体が正規データで埋まる想定で、そのまま上書きされずに残る可能性があるため、本格データ投入時にテスト行の要否を再確認すること。
+- **次にやること**: S3 ingest 実装時に、各論文の著者一覧を `authorships` に INSERT する処理を追加する（OpenAlex の `authorships[].author.display_name` 相当のフィールドを S3 データから取得する）。
+
+### 分野・年代の切り替え基盤（2026-11-10、コード基盤のみ先行実装）
+
+- **方針**: D1 の 10GB 上限に対応するため分野・年代ごとに D1 を分割する（ARCHITECT.md 3.4.2）計画に先立ち、「複数 DB を切り替えられるコード基盤」を今回入れた。実際の DB（5年単位の年代分割など）はまだ作成していない。現状は `DB_FIELD17_2016_2026` の1つだけを `DB_REGISTRY` に登録している。
+- **`worker/db.ts`**: `DB_REGISTRY: {field, yearRange, binding}[]` を新設。`resolveFieldDb(env, fieldParam, yearRangeParam?)` が分野・年代レンジから対応する `D1Database` を解決する（未登録の組み合わせは 404）。`listFields()`/`listYearRanges()` は `/api/fields` 用。
+- **API ルーティング変更**: 全エンドポイントを `/api/fields/17/...` 固定から `/api/fields/:field/...`（`yearRange` はクエリパラメータ）に変更。新規 `GET /api/fields`（`worker/api/fields.ts`）で登録済みの分野・年代レンジ一覧を返す。
+  - **Hono のサブルーター制約**: `app.route("/api/fields/:field/top", topRoute)` のようにマウント元でパスパラメータを切ると、サブルーター側の型に `:field` が伝播せず `c.req.param("field")` が `string | undefined` になる（実行時には値は正しく取れるが型エラーになる）。回避策として、各ルート自身が `/fields/:field/top` のようなフルパスを持ち、`app.route("/api", topRoute)` でマウントする方式にした。
+- **`worker/graph.ts`**: `graphKey()` に `field` を含め `graph/field{N}/seed-{id}-d{depth}.json` に変更。`buildSeedGraph()`/`fetchEdgesChunked()`/`fetchPapersChunked()` は `env` ではなく解決済みの `D1Database` を直接受け取るよう変更（呼び出し元が `resolveFieldDb()` で解決してから渡す）。
+- **`worker/index.ts`**: Graph Build Queue のメッセージに `field` を追加（`GraphBuildMessage`）。Queue コンシューマは `resolveDb(env, field)` で対象 DB を解決してから `buildSeedGraph` を呼ぶ。
+- **フロントエンド**: `src/api.ts` の全 fetch 関数が `field`/`yearRange` を引数に取るよう変更。`src/App.tsx` に `field`/`yearRange` state を追加し、起動時に `GET /api/fields` で選択肢を取得。`src/components/Header.tsx` に分野・年代のセレクトボックスを追加（現状は選択肢が1つなので実際の切り替えは未検証、API 自体は `curl` で動作確認済み）。切り替え時はグラフ・一覧・選択状態を全てリセットして再読み込みする。
+- **動作確認**: `curl` で `/api/fields`、`/api/fields/17/top?yearRange=2016-2026`、存在しない `field`/`yearRange` での 404 を確認。ブラウザで検索・ノード選択・詳細表示が新しい `:field` パス経由で正常動作することを確認。検索結果からのシード切り替え（`fetchSeedGraph`）も API レベルでは正しく新しいグラフ（祖先ノードを含む）を返すことを確認したが、画面の表示件数・スクロール位置の都合で見た目の変化が分かりにくいケースがあった（マルチ DB 機能自体の問題ではない）。
+- **未着手**: 実際の複数 DB 作成（5年単位の年代分割）、複数 DB をまたぐ `UNION ALL` 結合（SPEC.md 4.4 の結合ルール）、`<title>` タグ等での選択中分野名の動的反映。

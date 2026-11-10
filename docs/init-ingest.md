@@ -89,6 +89,21 @@ SET s3_endpoint = 's3.amazonaws.com';
 
 ## 3. 初期インポート手順
 
+### 3.0 段階実行の方針（小規模検証 → 本番実行）
+
+S3 スナップショットからの抽出・D1 投入は、スクリプト改修・実行環境・D1 投入方式のいずれも未検証の要素を含む。本番規模（約609万件、全1,898ファイル）に対して一度に流すと、不具合があった場合の手戻りコスト（処理時間・EC2利用料・D1への誤投入の後始末）が大きい。そのため、**小規模（1〜数ファイル）での動作確認を先に行い、各ステップが正しく動くことを確認してから、本番規模（全件・全ファイル）に移る**。
+
+| 段階 | 対象データ | 目的 | 完了条件 |
+|---|---|---|---|
+| **① 抽出スクリプトの動作確認** | `--limit-files` で 1〜数ファイルに限定 | httpfs 経由の S3 読み込み・列拡張（3.3 の追加検討事項）が正しく動くか確認。ダウンロード不要の確認も含む | `papers.csv`/`edges.parquet` が期待する列・形式で出力される |
+| **② 小規模 D1 投入の確認** | ①の出力（数千件規模） | D1 投入方式（3.4）・投入順序（papers→edges→child_cnt）が正しく動くか、既存の `recomputeChildCnt` と整合するかを確認 | 件数一致・`child_cnt` 不一致 0 件（3.6 と同じ検証を小規模データで実施） |
+| **③ 一部分野・一部年代での中規模実行** | 分野17・直近1〜2年分など、本番の一部 | 本番規模に近いデータで処理時間・D1サイズ・エッジ密度の見積もりを実測し、本番実行の計画（実行場所・バッチサイズ・所要時間）を確定する | 処理時間・出力サイズが見積もり通りか確認。EC2が必要かどうかの判断もここで行う |
+| **④ 本番実行（全件）** | 分野17・直近10年の全件 | 3.1〜3.6 の手順通り、本番データを一括投入する | 3.6 の検証項目を満たす |
+
+- ①〜③は同じローカル PC で実施できる想定（データ量が小さいため、2.1 のネットワーク帯域問題は発生しにくい）。③の実測結果を見て、④をローカル PC で続けるか EC2 に切り替えるかを決める。
+- ②・③で D1 に投入したテストデータは、④の本番投入前に削除する（`DELETE FROM papers; DELETE FROM edges;` 等）か、④を別の D1 データベースに対して行い検証後に本番 DB を切り替える。どちらの方式を取るかは③の結果を見て決める（5章の未確定事項に記載）。
+- 各段階の完了をもって次段階に進む。①の時点で列不足（`fwci`/`subfield`/`doi` 等）やスキーマ不整合が見つかれば、そこで `extract_cs.py` を修正し、②以降はやり直す。
+
 ### 3.1 対象ファイルの選定
 
 `data/openalex/manifest.json` の `files[].url` は `s3://openalex/data/parquet/works/updated_date={YYYY-MM-DD}/part_{NNNN}.parquet` の形式で、OpenAlex 側の「更新日」単位にパーティション分割されている。
@@ -118,17 +133,36 @@ SET s3_endpoint = 's3.amazonaws.com';
 
 ### 3.3 DuckDB での抽出
 
-既存の `data/openalex/extract_cs.py` をベースに、以下を変更して本番実行する。
+既存の `data/openalex/extract_cs.py` をベースに、以下を変更する。3.0 の段階①では `--limit-files` を付けて小規模に、段階④では外して全ファイルに対して実行する。
 
 - `--pattern` に S3 上の全ファイルの glob（例: `s3://openalex/data/parquet/works/*/*.parquet`）を渡す（3.2 参照、ローカルパスではなく S3 URL になる点が変更点）。
-- `--field 17 --min-year 2016` （分野17・直近10年、SPEC 4.3 準拠）で実行する。
+- `--field 17 --min-year 2016` （分野17・直近10年、SPEC 4.3 準拠）で実行する。段階③では `--min-year` を直近1〜2年に絞るなど、対象範囲も縮小する。
 - 出力は `papers.csv` / `edges.parquet`（または `.csv`）とし、既存スクリプトの出力形式をそのまま使う。
-- 実行前に `--count` で絞り込み後の件数を確認し、想定（約609万件、P0-1 実測値）から大きく外れないかチェックする。
+- 本番実行（段階④）の前に `--count` で絞り込み後の件数を確認し、想定（約609万件、P0-1 実測値）から大きく外れないかチェックする。
 - `external_ids.csv`（分野外から引用されている ID）は、SPEC 4.3「取り込み対象外の論文は祖先としてのみ必要な場合に限り追加」への対応候補として保持するが、PoC では当面使用しない（ARCHITECT.md 3.1 の簡略化方針を維持）。
 
 **スクリプトへの追加検討事項**（本番実行前に対応）:
 - `publication_date`（月精度）・`doi`・`fwci` ・`subfield` 列は現状 `extract_cs.py` の抽出対象に含まれていない（`papers.csv` は `id, title, year, cit, field` のみ）。D1 スキーマ（SPEC 4.4、`migrations/0003`）は `year`（月精度の小数）・`fwci`・`subfield`・`doi` 列を持つため、スクリプトを拡張してこれらの列も抽出する必要がある。
 - `child_cnt` は現行スクリプトでは分野内の「直接の子の数」を別テーブルとして出している。D1 投入時は `papers` 行に `child_cnt` 列として結合するか、投入後に `UPDATE ... SET child_cnt = (SELECT COUNT(*) ...)`（既存の `recomputeChildCnt` と同じクエリ）を流す。
+- **keywords の辞書化**（SPEC 4.4、`migrations/0005`）: OpenAlex の `keywords` 列は `STRUCT(id, display_name, score)[]`（Parquet 実データで確認済み、2026-11-10）であり、1論文あたり平均4.5件・最大22件のキーワードを持つ（分野17・直近10年相当のサンプルで実測）。D1 は配列を直接扱えないため、`keywords`（辞書: id, name）+ `paper_keywords`（中間テーブル: paper_id, keyword_id, score）に正規化する。DuckDB では `UNNEST` で展開してから集計する:
+  ```sql
+  -- 辞書（重複キーワードを除いた一意な id/name の組）
+  CREATE TABLE keywords AS
+  SELECT DISTINCT
+      regexp_extract(kw.id, 'keywords/([^/]+)$', 1) AS id,
+      kw.display_name AS name
+  FROM (SELECT unnest(keywords) AS kw FROM papers_raw);
+
+  -- 中間テーブル（論文×キーワード）
+  CREATE TABLE paper_keywords AS
+  SELECT
+      id AS paper_id,
+      regexp_extract(kw.id, 'keywords/([^/]+)$', 1) AS keyword_id,
+      kw.score AS score
+  FROM (SELECT id, unnest(keywords) AS kw FROM papers_raw);
+  ```
+  - 辞書テーブル（`keywords`）は OpenAlex 全体で語彙が有限（概算で数万語）のため小さく、分野・年代で DB を分割しても重複を気にせず複製してよい。
+  - `paper_keywords` は論文数に比例して増える（609万件 × 平均4.5件 ≈ 2,700万行規模を想定）。`WITHOUT ROWID` + 複合主キー（`migrations/0005`）で容量を抑える。D1 の容量試算（ARCHITECT.md 3.4.1）に `paper_keywords` 分も加味する必要がある（本書 3.6 の検証で実測する）。
 
 ### 3.4 D1 への投入
 
@@ -138,9 +172,9 @@ SET s3_endpoint = 's3.amazonaws.com';
    - DuckDB から直接 SQLite ファイルを生成できる（`ATTACH 'out.sqlite' AS sq (TYPE sqlite); CREATE TABLE sq.papers AS SELECT * FROM papers;` 等）。生成した SQLite ファイルを `wrangler d1 execute --file` で読み込ませる、または [D1 のインポート機能](https://developers.cloudflare.com/d1/best-practices/import-export-data/)（`wrangler d1 export`/`import` 相当）を使う。
    - 大きい場合はテーブル単位・チャンク単位で SQL ファイルを分割し、順次実行する。
 2. **R2 経由 + Worker 側バッチ処理**（代替案）: 抽出した CSV/Parquet を R2 にアップロードし、1 回限りの投入用 Worker スクリプト（またはローカルから `wrangler d1 execute` を繰り返し呼ぶスクリプト）で chunk 分割 INSERT を行う。既存の `BATCH_CHUNK_SIZE=500`、`SQL_IN_CHUNK_SIZE=90`（D1 のバインド変数上限）の制約を踏まえて実装する。
-3. 件数・ファイルサイズを実測した上で、どちらを採用するか P1 再着手時に決定する。目安として D1 の 1 データベース上限は 10 GB、行サイズ上限は 2 MB。
+3. 件数・ファイルサイズを実測した上で、どちらを採用するか決定する。目安として D1 の 1 データベース上限は 10 GB、行サイズ上限は 2 MB。**3.0 の段階②（小規模データ）でまず一方を試し、動作確認できた方式を段階③・④でも使う。**
 
-投入順序は既存 Workflow と同じ依存関係を守る: `papers` を先に全件投入 → `edges` を `cited` 側が `papers` に存在するものだけ投入 → `child_cnt` を再計算。
+投入順序は既存 Workflow と同じ依存関係を守る: `papers` を先に全件投入 → `edges` を `cited` 側が `papers` に存在するものだけ投入 → `child_cnt` を再計算。`keywords`（辞書）・`paper_keywords`（中間テーブル）はこの順序と独立しているため、`papers` 投入後であればどのタイミングでも投入してよい（`paper_keywords.paper_id` が `papers.id` に存在することだけ保証する）。
 
 ### 3.5 EC2 を使う場合の構成（データ量次第）
 
@@ -158,10 +192,13 @@ SET s3_endpoint = 's3.amazonaws.com';
 
 ### 3.6 検証
 
-- 抽出した論文数・エッジ数が、P0-1 で確認した推定件数（分野17・直近10年で約609万件）と大きくズレていないか確認する。
-- D1 投入後、`SELECT COUNT(*) FROM papers` / `edges` が抽出時の件数と一致することを確認する。
+以下は段階③・④（3.0）で共通して行う検証。段階②（小規模）でも件数一致・`child_cnt` 一致の2点は同様に確認する。
+
+- 抽出した論文数・エッジ数が、想定件数（段階④なら P0-1 実測の約609万件、段階③ならその年代の `--count` 結果）と大きくズレていないか確認する。
+- D1 投入後、`SELECT COUNT(*) FROM papers` / `edges` / `paper_keywords` が抽出時の件数と一致することを確認する。
 - `child_cnt` を再計算し、既存 Workflow 実装と同じロジック（`recomputeChildCnt`）で不一致がないか確認する（P1-5 と同様の検証）。
-- ARCHITECT.md 3.4.1 の容量試算（直近10年・全件規模で約6〜9 GB）と実測値を比較し、年代分割（3.4.2）の着手が必要かここで判断する。
+- `paper_keywords.keyword_id` が `keywords.id` に存在すること（外部キー相当の整合性）、`paper_keywords.paper_id` が `papers.id` に存在することを確認する（D1 は外部キー制約を強制しないため、投入後に `SELECT` で明示的に検証する）。
+- ARCHITECT.md 3.4.1 の容量試算（直近10年・全件規模で約6〜9 GB）と実測値を比較し、年代分割（3.4.2）の着手が必要かここで判断する（段階④で判断。段階③は参考値として記録）。`paper_keywords`（609万件×平均4.5件≈2,700万行想定）の実測サイズもここで確認し、3.4.1 の試算に加味する。
 
 ---
 
@@ -200,6 +237,7 @@ ARCHITECT.md 3.1 と同様、Cron Trigger による日次実行を基本とす�
 4. **`from_updated_date` フィルタの実際の挙動**: 1日あたりの更新件数・ページ数を小規模リクエストで確認する（Rate Limiter DO の既存実装がそのまま使えるか含め検証）。
 5. **撤回・削除された論文の扱い**: OpenAlex 側の変更をどう検知し、D1 側にどう反映するか（PoC では対応しない選択肢も含めて検討）。
 6. **`extract_cs.py` の拡張範囲**: `publication_date`（月精度）・`fwci`・`subfield`・`doi` 列の抽出、および `child_cnt` の結合方法を実装する（3.3 参照）。
+7. **段階②・③（3.0）のテストデータの後始末方法**: 本番の D1 に対して小規模・中規模データをそのまま投入して検証するか、別の D1 データベース（例: 検証用に新規作成）に対して行うかを決める。前者なら本番投入前に `DELETE` で消す手順を確立する必要があり、後者なら検証用 D1 の作成・破棄の手順を決める必要がある。
 
 ---
 

@@ -4,17 +4,24 @@ import { Header } from "./components/Header";
 import { OperationBar } from "./components/OperationBar";
 import { GraphView } from "./components/GraphView";
 import { SidePanel } from "./components/SidePanel";
-import { fetchHubs, fetchPaper, fetchSeedGraph, fetchTop } from "./api";
+import { fetchFields, fetchHubs, fetchPaper, fetchSeedGraph, fetchTop, type FieldInfo } from "./api";
 import { HUB_MIN_CHILD_DEFAULT, resolveLineageIds, resolveLineageSubtree, resolveSkeleton } from "./filters";
 import { SAMPLE_GRAPH } from "./sampleData";
 import type { GraphNode, PaperSummary, SeedGraph } from "./types";
 
 const TOP_CITED_SEED_FALLBACK = 2194775991; // Deep Residual Learning（被引用 1 位、2026-11 時点）
+const DEFAULT_FIELD = 17; // 計算機科学（SPEC.md 4.2）
 
 function App() {
 	const [graph, setGraph] = useState<SeedGraph>(SAMPLE_GRAPH);
 	const [isSample, setIsSample] = useState(true);
 	const [loadError, setLoadError] = useState<string | null>(null);
+
+	// 分野・年代の切り替え（D1 を分野・年代レンジで分割する方針、ARCHITECT.md 3.4.2 に対応）。
+	// 選択肢自体は /api/fields から取得する（worker/db.ts の DB_REGISTRY が真実の情報源）。
+	const [availableFields, setAvailableFields] = useState<FieldInfo[]>([]);
+	const [field, setField] = useState<number>(DEFAULT_FIELD);
+	const [yearRange, setYearRange] = useState<string | undefined>(undefined);
 
 	const [topPapers, setTopPapers] = useState<PaperSummary[]>([]);
 	const [hubPapers, setHubPapers] = useState<PaperSummary[]>([]);
@@ -31,23 +38,50 @@ function App() {
 	// サイドパネルはデフォルト非表示。論文選択時に自動で開く、または手動トグルで開閉する（表示エリアを広く保つため）。
 	const [panelOpen, setPanelOpen] = useState(false);
 
-	// SPEC.md 10章 P3: フロントエンドを実データに接続。失敗時はサンプルデータのまま表示を継続する（SPEC.md 7章「障害時」）。
+	// 利用可能な分野・年代レンジの一覧を取得する（Header のセレクトボックス用）。失敗しても致命的ではない
+	// （DEFAULT_FIELD・yearRange 未指定のまま動作を続けられる）。
 	useEffect(() => {
 		let cancelled = false;
+		fetchFields()
+			.then((res) => {
+				if (!cancelled) setAvailableFields(res.fields);
+			})
+			.catch(() => {
+				/* セレクトボックスの選択肢が増えないだけなので致命的ではない */
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, []);
+
+	// SPEC.md 10章 P3: フロントエンドを実データに接続。失敗時はサンプルデータのまま表示を継続する（SPEC.md 7章「障害時」）。
+	// 分野・年代を切り替えた場合もここで再読み込みする。別 DB のデータに切り替わるため、
+	// 古い選択・フォーカス・折りたたみ状態は意味を持たなくなるのでリセットする。
+	useEffect(() => {
+		let cancelled = false;
+		setSelectedId(null);
+		setFocusId(null);
+		setCollapsedIds(new Set());
+		setLineage([]);
+		setSelectedPaper(null);
 
 		async function load() {
 			try {
-				const [topRes, hubsRes] = await Promise.all([fetchTop(10), fetchHubs(HUB_MIN_CHILD_DEFAULT, 10)]);
+				const [topRes, hubsRes] = await Promise.all([
+					fetchTop(field, yearRange, 10),
+					fetchHubs(field, yearRange, HUB_MIN_CHILD_DEFAULT, 10),
+				]);
 				if (cancelled) return;
 				setTopPapers(topRes.papers);
 				setHubPapers(hubsRes.papers);
 
 				const seedId = topRes.papers[0]?.id ?? TOP_CITED_SEED_FALLBACK;
-				const seedGraph = await fetchSeedGraph(seedId, 2);
+				const seedGraph = await fetchSeedGraph(field, yearRange, seedId, 2);
 				if (cancelled) return;
 
 				setGraph(seedGraph);
 				setIsSample(false);
+				setLoadError(null);
 			} catch (err) {
 				if (!cancelled) {
 					setLoadError(err instanceof Error ? err.message : String(err));
@@ -59,7 +93,7 @@ function App() {
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [field, yearRange]);
 
 	// SPEC.md 6.3: 表示の絞り込みルール。
 	const visibleNodes = useMemo<GraphNode[]>(() => {
@@ -132,7 +166,7 @@ function App() {
 
 			if (!isSample) {
 				try {
-					const detail = await fetchPaper(id);
+					const detail = await fetchPaper(field, yearRange, id);
 					setLineage(detail.lineage);
 					setSelectedPaper(detail.paper);
 				} catch {
@@ -143,7 +177,7 @@ function App() {
 				setSelectedPaper(null);
 			}
 		},
-		[isSample],
+		[isSample, field, yearRange],
 	);
 
 	const handleDeselect = useCallback(() => {
@@ -184,7 +218,7 @@ function App() {
 			}
 			if (isSample) return;
 			try {
-				const seedGraph = await fetchSeedGraph(id, 2);
+				const seedGraph = await fetchSeedGraph(field, yearRange, id, 2);
 				setGraph(seedGraph);
 				setFocusId(null);
 				setCollapsedIds(new Set());
@@ -193,12 +227,19 @@ function App() {
 				setLoadError(err instanceof Error ? err.message : String(err));
 			}
 		},
-		[graph, handleSelect, isSample],
+		[graph, handleSelect, isSample, field, yearRange],
 	);
 
 	return (
 		<div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
-			<Header isSample={isSample} />
+			<Header
+				isSample={isSample}
+				availableFields={availableFields}
+				field={field}
+				onFieldChange={setField}
+				yearRange={yearRange}
+				onYearRangeChange={setYearRange}
+			/>
 			{loadError && (
 				<div
 					style={{
@@ -248,6 +289,8 @@ function App() {
 						onSelectPaperId={handleSelectFromList}
 						searchEnabled={!isSample}
 						onClose={() => setPanelOpen(false)}
+						field={field}
+						yearRange={yearRange}
 					/>
 				)}
 			</div>

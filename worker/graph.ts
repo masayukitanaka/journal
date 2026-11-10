@@ -1,5 +1,3 @@
-import { db } from "./db.js";
-
 // R2 グラフ JSON の形式（SPEC.md 4.5）。
 export interface SeedGraph {
 	seed: number;
@@ -9,8 +7,9 @@ export interface SeedGraph {
 	edges: [number, number][];
 }
 
-export function graphKey(seed: number, depth: number): string {
-	return `graph/field17/seed-${seed}-d${depth}.json`;
+// R2 バケットは分野・年代をまたいで共有し、プレフィックスで分ける（ARCHITECT.md 3.5）。
+export function graphKey(field: number, seed: number, depth: number): string {
+	return `graph/field${field}/seed-${seed}-d${depth}.json`;
 }
 
 // SPEC.md 6.5「実データでは、描画ノード数を 2,000 件程度までに抑える」。
@@ -22,7 +21,7 @@ const MAX_NODES = 2000;
 const SQL_IN_CHUNK_SIZE = 90;
 
 async function fetchEdgesChunked(
-	env: Env,
+	database: D1Database,
 	ids: number[],
 	column: "citing" | "cited",
 ): Promise<{ cited: number; citing: number }[]> {
@@ -30,7 +29,7 @@ async function fetchEdgesChunked(
 	for (let i = 0; i < ids.length; i += SQL_IN_CHUNK_SIZE) {
 		const chunk = ids.slice(i, i + SQL_IN_CHUNK_SIZE);
 		const placeholders = chunk.map(() => "?").join(",");
-		const { results } = await db(env)
+		const { results } = await database
 			.prepare(`SELECT cited, citing FROM edges WHERE ${column} IN (${placeholders})`)
 			.bind(...chunk)
 			.all<{ cited: number; citing: number }>();
@@ -40,7 +39,7 @@ async function fetchEdgesChunked(
 }
 
 async function fetchPapersChunked(
-	env: Env,
+	database: D1Database,
 	ids: number[],
 	minCit: number,
 ): Promise<{ id: number; year: number; title: string; cit: number; child_cnt: number }[]> {
@@ -48,7 +47,7 @@ async function fetchPapersChunked(
 	for (let i = 0; i < ids.length; i += SQL_IN_CHUNK_SIZE) {
 		const chunk = ids.slice(i, i + SQL_IN_CHUNK_SIZE);
 		const placeholders = chunk.map(() => "?").join(",");
-		const { results } = await db(env)
+		const { results } = await database
 			.prepare(
 				`SELECT id, year, title, cit, child_cnt FROM papers WHERE id IN (${placeholders}) AND cit >= ?`,
 			)
@@ -61,12 +60,12 @@ async function fetchPapersChunked(
 
 // D1 から祖先・子孫方向に depth まで BFS し、シード周辺グラフを構築する（ARCHITECT.md 3.2, 4.2）。
 export async function buildSeedGraph(
-	env: Env,
+	database: D1Database,
 	seed: number,
 	depth: number,
 	minCit: number,
 ): Promise<SeedGraph | null> {
-	const seedPaper = await db(env)
+	const seedPaper = await database
 		.prepare("SELECT id, field, title, year, cit, child_cnt FROM papers WHERE id = ?")
 		.bind(seed)
 		.first<{ id: number; field: number; title: string; year: number; cit: number; child_cnt: number }>();
@@ -82,8 +81,8 @@ export async function buildSeedGraph(
 		if (frontier.length === 0 || nodeCit.size >= MAX_NODES) break;
 
 		const [ancestorRows, descendantRows] = await Promise.all([
-			fetchEdgesChunked(env, frontier, "citing"),
-			fetchEdgesChunked(env, frontier, "cited"),
+			fetchEdgesChunked(database, frontier, "citing"),
+			fetchEdgesChunked(database, frontier, "cited"),
 		]);
 
 		const newIds: number[] = [];
@@ -101,7 +100,7 @@ export async function buildSeedGraph(
 		if (uniqueNewIds.length === 0) break;
 
 		// ノード数が上限を超える場合、新規ノードを被引用数上位に絞って打ち切る。
-		const newPapers = await fetchPapersChunked(env, uniqueNewIds, 0);
+		const newPapers = await fetchPapersChunked(database, uniqueNewIds, 0);
 		const remainingCapacity = MAX_NODES - nodeCit.size;
 		const selected = newPapers
 			.sort((a, b) => b.cit - a.cit)
@@ -112,7 +111,7 @@ export async function buildSeedGraph(
 	}
 
 	const idList = [...nodeCit.keys()];
-	const paperRows = await fetchPapersChunked(env, idList, minCit);
+	const paperRows = await fetchPapersChunked(database, idList, minCit);
 
 	const includedIds = new Set(paperRows.map((p) => p.id));
 	// seed 自身は minCit に関わらず常に含める。

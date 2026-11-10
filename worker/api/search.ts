@@ -1,13 +1,19 @@
 import { Hono } from "hono";
-import { db, type PaperRow } from "../db.js";
-import { FIELD_COMPUTER_SCIENCE, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX } from "../constants.js";
+import { resolveFieldDb, type PaperRow } from "../db.js";
+import { SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX } from "../constants.js";
 
-// GET /api/fields/17/search — 論文名・著者名の検索（SPEC.md 5章）。
+// GET /api/fields/:field/search — 論文名・著者名の検索（SPEC.md 5章）。
 // 検索方式は D1 の LIKE を初期採用（ARCHITECT.md 7-5）。将来的に速度が問題になれば転置インデックス等を検討する。
 // 著者名は authorships テーブル（migrations/0004、1論文に複数行）を LEFT JOIN し、
 // タイトルまたは著者名のどちらかに部分一致すればヒットさせる。1論文に複数の著者がマッチしうるため DISTINCT で重複を除く。
 // authorships テーブルへの実データ投入は S3 からの ingest 実装時に行う想定（それまでは LEFT JOIN 先が常に空でもタイトル検索は従来通り動作する）。
-export const searchRoute = new Hono<{ Bindings: Env }>().get("/", async (c) => {
+export const searchRoute = new Hono<{ Bindings: Env }>().get("/fields/:field/search", async (c) => {
+	const resolved = resolveFieldDb(c.env, c.req.param("field"), c.req.query("yearRange"));
+	if (!resolved.ok) {
+		return c.json({ error: resolved.error }, resolved.status);
+	}
+	const { db: database, field } = resolved;
+
 	const q = c.req.query("q");
 	const limitParam = c.req.query("limit") ? Number(c.req.query("limit")) : SEARCH_LIMIT_DEFAULT;
 
@@ -23,7 +29,7 @@ export const searchRoute = new Hono<{ Bindings: Env }>().get("/", async (c) => {
 	const escaped = q.replace(/[%_]/g, (ch) => `\\${ch}`);
 	const pattern = `%${escaped}%`;
 
-	const { results } = await db(c.env)
+	const { results } = await database
 		.prepare(
 			`SELECT DISTINCT p.id, p.field, p.title, p.year, p.cit, p.fwci, p.subfield, p.child_cnt, p.doi
 			 FROM papers p
@@ -31,7 +37,7 @@ export const searchRoute = new Hono<{ Bindings: Env }>().get("/", async (c) => {
 			 WHERE p.field = ? AND (p.title LIKE ? ESCAPE '\\' OR a.author_name LIKE ? ESCAPE '\\')
 			 ORDER BY p.cit DESC LIMIT ?`,
 		)
-		.bind(FIELD_COMPUTER_SCIENCE, pattern, pattern, limit)
+		.bind(field, pattern, pattern, limit)
 		.all<PaperRow>();
 
 	return c.json({ papers: results });

@@ -1,9 +1,15 @@
 import { Hono } from "hono";
-import { db, type PaperRow } from "../db.js";
-import { FIELD_COMPUTER_SCIENCE, HUB_MIN_CHILD_DEFAULT, TOP_LIMIT_DEFAULT, TOP_LIMIT_MAX } from "../constants.js";
+import { resolveFieldDb, type PaperRow } from "../db.js";
+import { HUB_MIN_CHILD_DEFAULT, TOP_LIMIT_DEFAULT, TOP_LIMIT_MAX } from "../constants.js";
 
-// GET /api/fields/17/hubs — 分岐数の上位論文（SPEC.md 5章、2章「ハブ」）
-export const hubsRoute = new Hono<{ Bindings: Env }>().get("/", async (c) => {
+// GET /api/fields/:field/hubs — 分岐数の上位論文（SPEC.md 5章、2章「ハブ」）
+export const hubsRoute = new Hono<{ Bindings: Env }>().get("/fields/:field/hubs", async (c) => {
+	const resolved = resolveFieldDb(c.env, c.req.param("field"), c.req.query("yearRange"));
+	if (!resolved.ok) {
+		return c.json({ error: resolved.error }, resolved.status);
+	}
+	const { db: database, field } = resolved;
+
 	const minChildParam = c.req.query("minChild")
 		? Number(c.req.query("minChild"))
 		: HUB_MIN_CHILD_DEFAULT;
@@ -17,11 +23,11 @@ export const hubsRoute = new Hono<{ Bindings: Env }>().get("/", async (c) => {
 	}
 	const limit = Math.min(limitParam, TOP_LIMIT_MAX);
 
-	const { results } = await db(c.env)
+	const { results } = await database
 		.prepare(
 			"SELECT id, field, title, year, cit, fwci, subfield, child_cnt, doi FROM papers WHERE field = ? AND child_cnt >= ? ORDER BY child_cnt DESC LIMIT ?",
 		)
-		.bind(FIELD_COMPUTER_SCIENCE, minChildParam, limit)
+		.bind(field, minChildParam, limit)
 		.all<PaperRow>();
 
 	return c.json({ papers: results }, 200, { "Cache-Control": "public, max-age=3600" });

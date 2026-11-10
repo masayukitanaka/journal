@@ -1,6 +1,11 @@
 import type { PaperDetail, PaperSummary, SeedGraph } from "./types";
 
-const BASE = "/api/fields/17";
+// 分野・年代の切り替え（worker/db.ts の DB_REGISTRY に対応）。
+export interface FieldInfo {
+	field: number;
+	name: string;
+	yearRanges: string[]; // "2016-2026" 形式
+}
 
 async function getJson<T>(url: string): Promise<T> {
 	const res = await fetch(url);
@@ -10,24 +15,50 @@ async function getJson<T>(url: string): Promise<T> {
 	return res.json() as Promise<T>;
 }
 
-export function fetchTop(limit = 10): Promise<{ papers: PaperSummary[] }> {
-	return getJson(`${BASE}/top?limit=${limit}`);
+function withYearRange(url: string, yearRange?: string): string {
+	if (!yearRange) return url;
+	const sep = url.includes("?") ? "&" : "?";
+	return `${url}${sep}yearRange=${encodeURIComponent(yearRange)}`;
 }
 
-export function fetchHubs(minChild = 4, limit = 10): Promise<{ papers: PaperSummary[] }> {
-	return getJson(`${BASE}/hubs?minChild=${minChild}&limit=${limit}`);
+export function fetchFields(): Promise<{ fields: FieldInfo[] }> {
+	return getJson("/api/fields");
 }
 
-export function fetchSeedGraph(seedId: number, depth = 2, minCit = 0): Promise<SeedGraph> {
-	return getJson(`${BASE}/seed/${seedId}?depth=${depth}&minCit=${minCit}`);
+export function fetchTop(field: number, yearRange: string | undefined, limit = 10): Promise<{ papers: PaperSummary[] }> {
+	return getJson(withYearRange(`/api/fields/${field}/top?limit=${limit}`, yearRange));
 }
 
-export function searchPapers(q: string, limit = 20): Promise<{ papers: PaperSummary[] }> {
-	return getJson(`${BASE}/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+export function fetchHubs(
+	field: number,
+	yearRange: string | undefined,
+	minChild = 4,
+	limit = 10,
+): Promise<{ papers: PaperSummary[] }> {
+	return getJson(withYearRange(`/api/fields/${field}/hubs?minChild=${minChild}&limit=${limit}`, yearRange));
 }
 
-export function fetchPaper(id: number): Promise<PaperDetail> {
-	return getJson(`${BASE}/paper/${id}`);
+export function fetchSeedGraph(
+	field: number,
+	yearRange: string | undefined,
+	seedId: number,
+	depth = 2,
+	minCit = 0,
+): Promise<SeedGraph> {
+	return getJson(withYearRange(`/api/fields/${field}/seed/${seedId}?depth=${depth}&minCit=${minCit}`, yearRange));
+}
+
+export function searchPapers(
+	field: number,
+	yearRange: string | undefined,
+	q: string,
+	limit = 20,
+): Promise<{ papers: PaperSummary[] }> {
+	return getJson(withYearRange(`/api/fields/${field}/search?q=${encodeURIComponent(q)}&limit=${limit}`, yearRange));
+}
+
+export function fetchPaper(field: number, yearRange: string | undefined, id: number): Promise<PaperDetail> {
+	return getJson(withYearRange(`/api/fields/${field}/paper/${id}`, yearRange));
 }
 
 export interface AttributionSource {

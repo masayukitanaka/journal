@@ -110,7 +110,8 @@ CREATE TABLE papers (
   cit       INTEGER NOT NULL,      -- 被引用数（OpenAlex 値）
   fwci      REAL,                  -- Field-weighted Citation Impact（OpenAlex `fwci`。出版年+3年分の被引用数/期待値の比。確認済み）
   subfield  INTEGER,
-  child_cnt INTEGER NOT NULL DEFAULT 0   -- 取り込み済みの直接の子（分岐数）
+  child_cnt INTEGER NOT NULL DEFAULT 0,  -- 取り込み済みの直接の子（分岐数）
+  doi       TEXT                  -- OpenAlex `doi`（"https://doi.org/..." 形式）。外部リンク用（マイグレーション 0003、2026-11-10）
 );
 CREATE INDEX idx_papers_field_year ON papers(field, year);
 CREATE INDEX idx_papers_field_cit  ON papers(field, cit DESC);
@@ -123,8 +124,30 @@ CREATE TABLE edges (
 ) WITHOUT ROWID;
 CREATE INDEX idx_edges_citing ON edges(citing);
 
--- 著者（次フェーズ）
--- CREATE TABLE authorships (...);
+-- 著者（論文名検索と合わせて著者名でも検索できるようにするため正規化。マイグレーション 0004、2026-11-10）
+-- 1論文に複数行（複数著者）を持つ。S3 からの ingest 実装時に実データを投入する想定（このテーブル定義のみ先行追加）。
+CREATE TABLE authorships (
+  paper_id    INTEGER NOT NULL,
+  author_name TEXT NOT NULL
+);
+CREATE INDEX idx_authorships_paper ON authorships(paper_id);
+CREATE INDEX idx_authorships_name  ON authorships(author_name);
+
+-- キーワード（OpenAlex `keywords`: STRUCT(id, display_name, score)[] を辞書化。マイグレーション 0005、2026-11-10）
+-- OpenAlex の語彙は分野をまたいで有限（約数万語）なため、辞書テーブルは分野 DB をまたいで重複しても小さい。
+CREATE TABLE keywords (
+  id   TEXT PRIMARY KEY,  -- OpenAlex の keyword スラッグ（例: "mysql"）
+  name TEXT NOT NULL      -- OpenAlex の display_name（例: "MySQL"）
+);
+
+-- 論文とキーワードの中間テーブル（多対多）。1論文に複数行、1キーワードも複数論文に紐づく。
+CREATE TABLE paper_keywords (
+  paper_id   INTEGER NOT NULL,
+  keyword_id TEXT NOT NULL,
+  score      REAL,  -- OpenAlex の score（関連度、0.0〜1.0）
+  PRIMARY KEY (paper_id, keyword_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_paper_keywords_keyword ON paper_keywords(keyword_id);
 ```
 
 - 分岐数は `child_cnt` として事前計算する（集計クエリを毎回走らせない）。
@@ -142,7 +165,7 @@ CREATE INDEX idx_edges_citing ON edges(citing);
 
 ### 4.5 R2 のグラフ JSON（案）
 
-キー: `graph/field17/seed-{id}-d{depth}.json`
+キー: `graph/field{分野ID}/seed-{id}-d{depth}.json`（例: `graph/field17/seed-123456-d2.json`。2026-11-10、`worker/graph.ts` の `graphKey()`）
 
 ```json
 {
@@ -162,19 +185,23 @@ CREATE INDEX idx_edges_citing ON edges(citing);
 
 ## 5. API 仕様（案）
 
-すべて `GET`、JSON 応答。
+すべて `GET`、JSON 応答。`:field` は分野 ID（計算機科学は 17）。分野・年代ごとに D1 を分割する方針
+（4.4「分野 DB の結合ルール」、ARCHITECT.md 3.4.2）に対応し、`:field` パスパラメータと `yearRange`
+クエリパラメータ（`"2016-2026"` 形式、省略時はその分野の既定レンジ）でどの DB を見るか指定する
+（`worker/db.ts` の `DB_REGISTRY` が実際に登録済みの組み合わせの正とする。2026-11-10 追加）。
 
 | パス | 説明 | 主なパラメータ |
 |---|---|---|
-| `/api/fields/17/top` | 被引用の上位論文 | `from`（年）、`limit`（既定 50、最大 200） |
-| `/api/fields/17/hubs` | 分岐数の上位論文 | `minChild`（既定 4）、`limit` |
-| `/api/fields/17/seed/{id}` | シード周辺のグラフ | `depth`（既定 2、最大 3）、`minCit` |
-| `/api/fields/17/search` | 論文名の検索 | `q`、`limit`（検索方式は要検討） |
-| `/api/fields/17/paper/{id}` | 論文の詳細と系譜 | — |
+| `/api/fields` | 登録済みの分野・年代レンジの一覧（フロントの切り替え UI 用） | — |
+| `/api/fields/:field/top` | 被引用の上位論文 | `from`（年）、`limit`（既定 50、最大 200）、`yearRange` |
+| `/api/fields/:field/hubs` | 分岐数の上位論文 | `minChild`（既定 4）、`limit`、`yearRange` |
+| `/api/fields/:field/seed/{id}` | シード周辺のグラフ | `depth`（既定 2、最大 3）、`minCit`、`yearRange` |
+| `/api/fields/:field/search` | 論文名・著者名の検索（`papers` と `authorships` を LEFT JOIN、どちらかに部分一致でヒット。2026-11-10 著者名検索を追加） | `q`、`limit`、`yearRange` |
+| `/api/fields/:field/paper/{id}` | 論文の詳細と系譜 | `yearRange` |
 
 応答の共通事項:
 - キャッシュ可能なものには `Cache-Control` を付ける。
-- 取得できなかった場合は、`404`（論文なし）、`429`（外部 API 制限）、`503`（一時的な失敗）を返す。
+- 取得できなかった場合は、`404`（論文なし、または `:field`/`yearRange` に対応する DB が未登録）、`400`（パラメータ不正）、`429`（外部 API 制限）、`503`（一時的な失敗）を返す。
 
 ### 5.1 キャッシュ方針（案。数値は実測で調整）
 

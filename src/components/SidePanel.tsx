@@ -17,6 +17,8 @@ interface SidePanelProps {
 	onSelectPaperId: (id: number) => void;
 	searchEnabled: boolean;
 	onClose: () => void;
+	field: number;
+	yearRange: string | undefined;
 }
 
 // SPEC.md 6.1「サイドパネル（右）」, 6.4「操作」。
@@ -33,6 +35,8 @@ export function SidePanel({
 	onSelectPaperId,
 	searchEnabled,
 	onClose,
+	field,
+	yearRange,
 }: SidePanelProps) {
 	return (
 		<aside
@@ -52,7 +56,7 @@ export function SidePanel({
 			<button className="btn btn-ghost" onClick={onClose} style={{ alignSelf: "flex-end" }}>
 				Close ✕
 			</button>
-			{searchEnabled && <SearchBox onSelect={onSelectPaperId} />}
+			{searchEnabled && <SearchBox field={field} yearRange={yearRange} onSelect={onSelectPaperId} />}
 
 			<section>
 				<h2 style={{ fontSize: 13, margin: "0 0 8px", color: "var(--muted-text)", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.3 }}>
@@ -116,8 +120,16 @@ function ExternalLinks({ paper }: { paper: PaperSummary | null }) {
 	);
 }
 
-// SPEC.md 5章「/api/fields/17/search」。
-function SearchBox({ onSelect }: { onSelect: (id: number) => void }) {
+// SPEC.md 5章「/api/fields/:field/search」。
+function SearchBox({
+	field,
+	yearRange,
+	onSelect,
+}: {
+	field: number;
+	yearRange: string | undefined;
+	onSelect: (id: number) => void;
+}) {
 	const [query, setQuery] = useState("");
 	const [results, setResults] = useState<PaperSummary[]>([]);
 	const [loading, setLoading] = useState(false);
@@ -130,7 +142,7 @@ function SearchBox({ onSelect }: { onSelect: (id: number) => void }) {
 		}
 		setLoading(true);
 		try {
-			const res = await searchPapers(q, 10);
+			const res = await searchPapers(field, yearRange, q, 10);
 			setResults(res.papers);
 		} catch {
 			setResults([]);
@@ -154,7 +166,7 @@ function SearchBox({ onSelect }: { onSelect: (id: number) => void }) {
 					className="ctl-input"
 					value={query}
 					onChange={(e) => runSearch(e.target.value)}
-					placeholder="Enter a paper title..."
+					placeholder="Title or author name..."
 				/>
 			</div>
 			{loading && <div style={{ color: "var(--muted-text)", marginTop: 6 }}>Searching...</div>}

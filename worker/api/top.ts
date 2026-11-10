@@ -1,9 +1,15 @@
 import { Hono } from "hono";
-import { db, type PaperRow } from "../db.js";
-import { FIELD_COMPUTER_SCIENCE, TOP_LIMIT_DEFAULT, TOP_LIMIT_MAX } from "../constants.js";
+import { resolveFieldDb, type PaperRow } from "../db.js";
+import { TOP_LIMIT_DEFAULT, TOP_LIMIT_MAX } from "../constants.js";
 
-// GET /api/fields/17/top — 被引用の上位論文（SPEC.md 5章）
-export const topRoute = new Hono<{ Bindings: Env }>().get("/", async (c) => {
+// GET /api/fields/:field/top — 被引用の上位論文（SPEC.md 5章）
+export const topRoute = new Hono<{ Bindings: Env }>().get("/fields/:field/top", async (c) => {
+	const resolved = resolveFieldDb(c.env, c.req.param("field"), c.req.query("yearRange"));
+	if (!resolved.ok) {
+		return c.json({ error: resolved.error }, resolved.status);
+	}
+	const { db: database, field } = resolved;
+
 	const fromYear = c.req.query("from") ? Number(c.req.query("from")) : undefined;
 	const limitParam = c.req.query("limit") ? Number(c.req.query("limit")) : TOP_LIMIT_DEFAULT;
 
@@ -16,16 +22,16 @@ export const topRoute = new Hono<{ Bindings: Env }>().get("/", async (c) => {
 	const limit = Math.min(limitParam, TOP_LIMIT_MAX);
 
 	const query = fromYear
-		? db(c.env)
+		? database
 				.prepare(
 					"SELECT id, field, title, year, cit, fwci, subfield, child_cnt, doi FROM papers WHERE field = ? AND year >= ? ORDER BY cit DESC LIMIT ?",
 				)
-				.bind(FIELD_COMPUTER_SCIENCE, fromYear, limit)
-		: db(c.env)
+				.bind(field, fromYear, limit)
+		: database
 				.prepare(
 					"SELECT id, field, title, year, cit, fwci, subfield, child_cnt, doi FROM papers WHERE field = ? ORDER BY cit DESC LIMIT ?",
 				)
-				.bind(FIELD_COMPUTER_SCIENCE, limit);
+				.bind(field, limit);
 
 	const { results } = await query.all<PaperRow>();
 
