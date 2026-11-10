@@ -13,7 +13,7 @@
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -37,4 +37,86 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
 	 */
 	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
+	/**
+	 * D1 Database — 分野 17（計算機科学）・2016〜2026 年の論文・引用エッジ（SPEC.md 4.4, ARCHITECT.md 3.4）
+	 * https://developers.cloudflare.com/d1/
+	 * remote: true により、ローカル開発（vite dev）でも本番 D1 を直接参照する（ローカル D1 は P1 のテスト後に空のまま）。
+	 * https://developers.cloudflare.com/workers/vite-plugin/reference/remote-bindings/
+	 */
+	"d1_databases": [
+		{
+			"binding": "DB_FIELD17_2016_2026",
+			"database_name": "field17_2016_2026",
+			"database_id": "256986fe-4e3a-45c4-801d-bd613dab19e6",
+			"remote": true
+		}
+	],
+	/**
+	 * R2 Bucket — 生データ・シード単位グラフ JSON（ARCHITECT.md 3.5）
+	 * https://developers.cloudflare.com/r2/
+	 */
+	"r2_buckets": [
+		{
+			"binding": "BUCKET_FIELD17",
+			"bucket_name": "journal-field17"
+		}
+	],
+	/**
+	 * Queues — グラフ構築の非同期化（ARCHITECT.md 3.2）
+	 * https://developers.cloudflare.com/queues/
+	 */
+	"queues": {
+		"producers": [
+			{
+				"binding": "GRAPH_BUILD_QUEUE",
+				"queue": "journal-graph-build"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "journal-graph-build"
+			}
+		]
+	},
+	/**
+	 * Workflows — OpenAlex からの取り込み ETL（ARCHITECT.md 3.1）。
+	 * https://developers.cloudflare.com/workflows/
+	 */
+	"workflows": [
+		{
+			"binding": "INGEST_WORKFLOW",
+			"name": "journal-ingest-workflow",
+			"class_name": "IngestWorkflow"
+		}
+	],
+	/**
+	 * Durable Objects — 外部 API 呼び出しのレート制御直列化（ARCHITECT.md 3.3）。
+	 * https://developers.cloudflare.com/durable-objects/
+	 */
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "RATE_LIMITER_OPENALEX",
+				"class_name": "RateLimiterOpenAlex"
+			},
+			{
+				"name": "RATE_LIMITER_SEMANTIC_SCHOLAR",
+				"class_name": "RateLimiterSemanticScholar"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["RateLimiterOpenAlex", "RateLimiterSemanticScholar"]
+		}
+	],
+	/**
+	 * Cron Trigger — 日次 1 回、Ingest Workflow を起動する（ARCHITECT.md 3.1）。
+	 * UTC 18:00（JST 翌 3:00、深夜帯）。
+	 * https://developers.cloudflare.com/workers/platform/cron-triggers
+	 */
+	"triggers": {
+		"crons": ["0 18 * * *"]
+	}
 }
