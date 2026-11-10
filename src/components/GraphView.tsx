@@ -228,7 +228,21 @@ export function GraphView({ nodes, edges, allNodesById, allEdges, selectedId, li
 		e.preventDefault();
 		if (e.metaKey || e.ctrlKey) {
 			const delta = e.deltaY > 0 ? 0.9 : 1.1;
-			setTransform((t) => ({ ...t, scale: Math.min(4, Math.max(0.2, t.scale * delta)) }));
+			const rect = svgRef.current?.getBoundingClientRect();
+			// カーソル位置（SVG 要素基準）を中心に拡大縮小する。中心のワールド座標が
+			// ズーム前後で同じ画面位置に留まるよう x/y を一緒に補正する。
+			const cursorX = rect ? e.clientX - rect.left : 0;
+			const cursorY = rect ? e.clientY - rect.top : 0;
+			setTransform((t) => {
+				const nextScale = Math.min(4, Math.max(0.2, t.scale * delta));
+				const worldX = (cursorX - t.x) / t.scale;
+				const worldY = (cursorY - t.y) / t.scale;
+				return {
+					scale: nextScale,
+					x: cursorX - worldX * nextScale,
+					y: cursorY - worldY * nextScale,
+				};
+			});
 			return;
 		}
 		setTransform((t) => ({ ...t, x: t.x - e.deltaX, y: t.y - e.deltaY }));

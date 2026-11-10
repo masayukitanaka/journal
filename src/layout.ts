@@ -24,37 +24,37 @@ function yearToMonthIndex(year: number): number {
 	return y * 12 + month;
 }
 
-// SPEC.md 6.2: 行の並び（Y 軸）は、子の被引用合計の多い順に上から配置する（系統の並びを安定させるため）。
-function computeChildCitationSum(nodes: GraphNode[], edges: [number, number][]): Map<number, number> {
-	const citById = new Map(nodes.map((n) => [n.id, n.c]));
-	const sums = new Map<number, number>(nodes.map((n) => [n.id, 0]));
-
-	for (const [cited, citing] of edges) {
-		const childCit = citById.get(citing) ?? 0;
-		sums.set(cited, (sums.get(cited) ?? 0) + childCit);
-	}
-	return sums;
-}
-
+// Y 軸（行の並び）は、同じ月（同じ X 座標）に属するノードだけをグループにし、
+// グループ内を論文名のアルファベット順に並べる。X 軸が既に月単位で左から右に並んでいるため、
+// Y 軸でも「同じ月なら名前順」という一貫した規則にすることで、探している論文を見つけやすくする
+// （2026-11-10 変更。以前は全ノードを「子の被引用合計」でグローバルにソートしていた）。
 export function layoutGraph(nodes: GraphNode[], edges: [number, number][]): LayoutResult {
 	if (nodes.length === 0) {
 		return { nodes: [], edges: [], minYear: 0, maxYear: 0 };
 	}
 
-	const childCitationSum = computeChildCitationSum(nodes, edges);
-	const sorted = [...nodes].sort((a, b) => {
-		const diff = (childCitationSum.get(b.id) ?? 0) - (childCitationSum.get(a.id) ?? 0);
-		return diff !== 0 ? diff : b.c - a.c;
-	});
-
 	const minYear = Math.min(...nodes.map((n) => n.y));
 	const maxYear = Math.max(...nodes.map((n) => n.y));
 
-	const positioned: PositionedNode[] = sorted.map((node, index) => ({
-		...node,
-		x: yearToX(node.y, minYear),
-		yPos: MARGIN + index * Y_ROW_HEIGHT,
-	}));
+	// 同じ月（yearToMonthIndex が同じ値）ごとにグループ化する。
+	const groups = new Map<number, GraphNode[]>();
+	for (const node of nodes) {
+		const key = yearToMonthIndex(node.y);
+		if (!groups.has(key)) groups.set(key, []);
+		groups.get(key)!.push(node);
+	}
+
+	const positioned: PositionedNode[] = [];
+	for (const groupNodes of groups.values()) {
+		const sortedGroup = [...groupNodes].sort((a, b) => a.t.localeCompare(b.t));
+		sortedGroup.forEach((node, index) => {
+			positioned.push({
+				...node,
+				x: yearToX(node.y, minYear),
+				yPos: MARGIN + index * Y_ROW_HEIGHT,
+			});
+		});
+	}
 
 	return { nodes: positioned, edges, minYear, maxYear };
 }
