@@ -36,10 +36,12 @@ DEFAULT_WORK = os.path.join(os.path.dirname(__file__), "../../data/openalex/work
 _local = threading.local()
 
 
-def connection(threads: int) -> duckdb.DuckDBPyConnection:
+def connection(threads: int, memory_limit: str) -> duckdb.DuckDBPyConnection:
     con = getattr(_local, "con", None)
     if con is None:
         con = duckdb.connect()
+        # 既定の memory_limit は「物理メモリの 80%」で接続ごとに効くため、--jobs 並列だと合計で OOM になる
+        con.execute(f"SET memory_limit = '{memory_limit}'")
         con.execute("LOAD httpfs")
         con.execute("SET s3_region = 'us-east-1'")
         con.execute(f"SET threads TO {threads}")
@@ -113,7 +115,7 @@ def stage_one(url: str, out_dir: str, args) -> tuple[str, int, float]:
     last_err: Exception | None = None
     for attempt in range(1, args.retries + 1):
         try:
-            con = connection(args.threads)
+            con = connection(args.threads, args.memory_limit)
             con.execute(stage_sql(url, tmp, args.field, args.min_year, args.max_year))
             n = con.execute(f"SELECT count(*) FROM read_parquet({q(tmp)})").fetchone()[0]
             os.replace(tmp, out)
@@ -137,6 +139,8 @@ def main() -> None:
     ap.add_argument("--limit-files", type=int, default=0, help="更新日の新しい順に N ファイルだけ処理（0 = 全部）")
     ap.add_argument("--jobs", type=int, default=4, help="同時に処理するファイル数")
     ap.add_argument("--threads", type=int, default=2, help="ファイル 1 つあたりの DuckDB スレッド数")
+    ap.add_argument("--memory-limit", default="1GB",
+                    help="DuckDB 接続 1 つあたりのメモリ上限（合計はおよそ --jobs 倍。7.6 GB の EC2 で 4 並列なら 1GB）")
     ap.add_argument("--retries", type=int, default=3)
     args = ap.parse_args()
 
