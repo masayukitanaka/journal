@@ -36,6 +36,9 @@ interface DbRegistryEntry {
 // field17_2021_2025 を既定にする（2026-11-11、S3 ingest で実データが投入済み。実データの無い
 // 旧 DB field17_2016_2026 は wrangler.jsonc の binding は残すがレジストリからは外してある）。
 const DB_REGISTRY: DbRegistryEntry[] = [
+	// 5 年単位の年代 DB（SPEC.md 4.3、ARCHITECT.md 3.4.2、2026-11-11 作成）。先頭の field17_2021_2025 が
+	// 既定（yearRange 省略時）。旧方針の仮 DB（field17_2016_2026）は実データ投入・動作確認後に廃止済みで、
+	// wrangler.jsonc の binding は残すがこのレジストリからは外してある。
 	{ field: 17, yearRange: { start: 2021, end: 2025 }, binding: "DB_FIELD17_2021_2025" },
 	{ field: 17, yearRange: { start: 2006, end: 2010 }, binding: "DB_FIELD17_2006_2010" },
 	{ field: 17, yearRange: { start: 2011, end: 2015 }, binding: "DB_FIELD17_2011_2015" },

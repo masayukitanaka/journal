@@ -52,18 +52,27 @@
 完了条件: 分野17・直近10年の全件規模（約609万件）が D1 に投入され、`child_cnt` が検証できること。**小規模検証 → 中規模実行 → 本番実行の段階を踏む**（詳細手順・各段階の完了条件は [docs/init-ingest.md](./init-ingest.md) 3章・3.0）。
 
 #### P1-0-①. 抽出スクリプトの動作確認（小規模）
-- [ ] `extract_cs.py` を拡張する — `--pattern` に S3 URL（`s3://openalex/data/parquet/works/*/*.parquet`）を渡せるようにし、httpfs 拡張のロード・`s3_region` 設定を追加する（init-ingest.md 3.2）
-- [ ] `extract_cs.py` の抽出列を D1 スキーマ（migrations 0001-0003）に合わせて拡張する — 現状 `papers.csv` は `id, title, year, cit, field` のみで、`publication_date`（月精度の `year`）・`fwci`・`subfield`・`doi` が欠けている（init-ingest.md 3.3）
-- [ ] `extract_cs.py` に `keywords`/`paper_keywords` の抽出を追加する — `UNNEST` で `STRUCT(id, display_name, score)[]` を展開し、`keywords`（辞書: id, name）と `paper_keywords`（中間テーブル: paper_id, keyword_id, score）を生成する（init-ingest.md 3.3、migrations/0005）
-- [ ] `--limit-files 1`（または数ファイル）+ S3 URL で実行し、httpfs 経由で正しく S3 から読めること、拡張した列（`keywords`/`paper_keywords` 含む）が期待通り出力されることを確認する
+`extract_cs.py` は検証用スクリプトのため使わず、`scripts/ingest/` に新規作成した（2026-11-11）。
+- [x] `scripts/ingest/stage.py` を作成 — manifest.json の S3 URL を 1 ファイルずつ DuckDB httpfs で直接読み（ダウンロードなし）、分野・出版年で絞った中間 Parquet を `data/openalex/work/stage/` に出力。出力済みファイルはスキップして途中から再開できる
+- [x] `scripts/ingest/build.py` を作成 — 中間 Parquet を結合し、D1 スキーマ（migrations 0001〜0005）に合わせて **分野 × 5 年単位の DB ごと**（ARCHITECT.md 3.4.2、取り込み範囲は 2006 年以降の約20年、`field17_2006_2010` / `field17_2011_2015` / `field17_2016_2020` / `field17_2021_2025` / `field17_2026_2030`）に `papers`（月精度 `year`・`fwci`・`subfield`・`doi`・`child_cnt` 込み）/ `edges` / `authorships` / `keywords` / `paper_keywords` を `data/openalex/work/out/{DB名}/` に出力。重複 id は最新 `updated_date` を採用
+  - 所属 DB は `publication_year` で決める。`edges` は citing 側の DB に置き、cited は取り込んだ全年代のどこかに存在すれば残す（ARCHITECT.md 4.4 の結合ルール、自己引用は除外）
+  - `child_cnt` は全年代の edges から計算（DB をまたぐ子も数える）。そのため DB 単体で `recomputeChildCnt` を流すと値が変わる点に注意（要対応、下記）
+- [x] 3 ファイル（2.2GB、更新日 2026-10-14、2006〜2026年）で実行確認 — stage 約14秒（S3 読み込み 約160MB/s、EC2 上）、論文 42,337 件・edges 4,768。NOT NULL 違反・年代外の論文・DB 内に citing がないエッジ・孤立 paper_keywords・`child_cnt` 合計とエッジ数の不一致はすべて 0
+- 観察:
+  - edges の約 61% が別 DB（過去の年代）の論文を cited に持つ。系譜追跡・シードグラフ（`worker/graph.ts`）は DB をまたぐ結合（ARCHITECT.md 3.4.0 で未実装）が前提になる
+  - keywords の語彙は 3 ファイルだけで 8.3 万語あり、init-ingest.md 3.3 の「全体で数万語」という見積もりより大きい（③で実測）
+  - `publication_date` が 1 月の論文が多い（約27%、OpenAlex 側で月不明の論文が 1/1 になっていると思われる）
+- [ ] 年代分割に合わせた D1 の作り直し — 現在の `field17_2016_2026` を廃止し、5 年単位の DB を作成・`wrangler.jsonc`・`DB_REGISTRY` に登録する
+- [ ] `recomputeChildCnt`（日次差分）を DB をまたぐ子の数え方に合わせる
 
 #### P1-0-②. 小規模 D1 投入の確認
-- [ ] D1 投入方式を仮決定する — `wrangler d1 execute --file`（SQLite dump 生成）か、R2 経由 + Worker チャンク投入のどちらかを試す（init-ingest.md 3.4）
-- [ ] テスト用の投入先（本番 D1 に投入して後で削除するか、検証用 D1 を別途作るか）を決める（init-ingest.md 5章 未確定事項7）
-- [ ] ①の小規模出力（数千件規模）を `papers` → `edges` → `child_cnt` 再計算 → `keywords`/`paper_keywords` の順に投入する
-- [ ] 件数一致・`child_cnt` 不一致 0 件を確認する（init-ingest.md 3.6 と同じ検証を小規模データで実施）
-- [ ] `paper_keywords.keyword_id` が `keywords.id` に存在すること、`paper_keywords.paper_id` が `papers.id` に存在することを確認する（init-ingest.md 3.6）
-- [ ] テスト用に投入したデータを後始末する（本番 D1 を使った場合は削除、検証用 D1 を使った場合は保持または破棄）
+- [x] D1 投入方式を決める — `scripts/ingest/export_sql.py`（Parquet → 複数行 INSERT の SQL ファイル）+ `scripts/ingest/load_d1.py`（`wrangler d1 execute --file` で投入・検証）を作成（init-ingest.md 3.4）
+- [x] テスト用の投入先を決める — 5 年単位の新しい D1（`field17_2006_2010` 〜 `field17_2026_2030`）を作り、そこに投入して検証する。旧 `field17_2016_2026` は新 DB で動作確認できるまで残す
+- [x] ローカル D1（検証用の wrangler 設定、migrations 0001〜0005 適用）に①の出力（3 ファイル分、論文 42,337 件）を投入し、件数・`child_cnt` 合計・被引用数合計・参照整合性（edges の citing、authorships・paper_keywords の paper_id、paper_keywords の keyword_id）がすべて一致することを確認（2026-11-11）
+- [x] wrangler の Cloudflare 認証を設定する — EC2 の `~/.bashrc` に `CLOUDFLARE_API_TOKEN` を設定（2026-11-11）
+- [x] 本番の D1 を 5 つ作成し（WNAM、`field17_2006_2010` 〜 `field17_2026_2030`）、`wrangler.jsonc`・`DB_REGISTRY`（旧 `field17_2016_2026` を既定のまま残し、その後ろに追加）に登録、`wrangler types` で型を再生成、migrations 0001〜0005 を適用（2026-11-11）
+- [x] 本番 D1 に①の出力を `load_d1.py --remote` で投入し、全 5 DB で検証が通ることを確認（約1分半、2026-11-11）。D1 サイズ: 2006_2010 5.8MB / 2011_2015 7.4MB / 2016_2020 10.6MB / 2021_2025 25.6MB / 2026_2030 4.2MB（論文 1 件あたり約 1.3KB、edges はサンプルのため少ない）
+- [ ] テスト用に投入したデータを後始末する（本番実行④の前に各テーブルを空にする。現在は 5 DB に①の小規模データが入ったまま）
 
 #### P1-0-③. 一部分野・一部年代での中規模実行
 - [ ] 分野17・直近1〜2年分など、本番の一部を対象に `--min-year` を絞って抽出する
@@ -428,3 +437,10 @@
 - **動作確認**: `curl -X DELETE "/api/fields/17/seed/2991046523"` で3つの depth 分のキーが削除されること、削除後の `GET` が `X-Data-Source: d1-direct`（D1から再計算）に戻ることを確認した。
 - **未実装のまま**: 本番相当の自動キャッシュ無効化（グラフ生成ロジックのバージョン番号をキーに埋め込む等）は見送り。コード変更時に古いキャッシュが残る問題は、今後もこの DELETE エンドポイントで都度クリアする運用想定。
 - **一斉削除の追加**: 「seed_id をいちいち調べるのが面倒」とのユーザー要望を受け、`DELETE /api/fields/:field/seed`（id 無し）を追加した。`BUCKET_FIELD17.list({prefix: "graph/field{N}/"})` でその分野の全キャッシュキーを列挙し（R2 の list は1回最大1000件なので `cursor` でページングして全件集める）、`delete()` で一括削除する（R2 の delete も1回最大1000件のため1000件ずつに分割）。レスポンスは削除件数のみ（`{deletedCount}`）。`curl -X DELETE "/api/fields/17/seed"` で動作確認し、2つの異なる seed のキャッシュが両方削除され、以降の GET がどちらも `d1-direct` に戻ることを確認した。
+
+### 分野・年代切り替え時のローディングスピナー追加（2026-11-11）
+
+- **背景**: ユーザーから「ドロップダウンで年代を選択してから表示が終わるのに時間がかかるので、その間はスピナーを表示して読み込み中であることを明確にしたい」との要望。
+- **`src/App.tsx`**: `isLoadingGraph` state を追加。`field`/`yearRange` 変更時の `useEffect`（top/hubs/シードグラフを再取得する箇所）の先頭で `true` にし、`finally` で必ず `false` に戻す。グラフ表示エリア（`<main>`、`position: relative` を追加）に、`isLoadingGraph` のときだけ `position: absolute; inset: 0` のオーバーレイ（スピナー + "Loading..." テキスト、背景は `var(--graph-bg)` を半透明に）を重ねる。
+- **`src/App.css`**: `@keyframes spin` と `.loading-spinner`（ボーダーの一部を `var(--accent)` にした回転リングスピナー、CSSのみでJSライブラリ不要）を追加。
+- **動作確認**: ローカル環境は読み込みが速くスピナーが一瞬で消えてしまうため、ブラウザの `window.fetch` を一時的にパッチして `/api/fields/` 宛のリクエストを3秒遅延させた状態で年代を切り替え、スピナーと「Loading...」が画面中央に表示されること、読み込み完了後は消えて新しいグラフに正しく切り替わることを確認した（確認用のパッチは確認後に元に戻した）。

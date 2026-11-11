@@ -52,6 +52,10 @@
 			"database_id": "256986fe-4e3a-45c4-801d-bd613dab19e6",
 			"remote": true
 		},
+		// 5 年単位の年代 DB（SPEC.md 4.3、ARCHITECT.md 3.4.2、2026-11-11 作成）。
+		// S3 スナップショットからの初期インポート（docs/init-ingest.md、scripts/ingest/）の投入先。
+		// 実データ投入・動作確認済み（worker/db.ts の DB_REGISTRY で既定として使用中）。上の
+		// field17_2016_2026（旧方針の仮 DB）は binding を残すがレジストリからは外してある。
 		{
 			"binding": "DB_FIELD17_2006_2010",
 			"database_name": "field17_2006_2010",

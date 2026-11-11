@@ -2,7 +2,7 @@
 
 - ステータス: ドラフト（PoC フェーズ）
 - 前提: [docs/SPEC.md](./SPEC.md)（要求仕様）、[docs/ARCHITECT.md](./ARCHITECT.md)（Cloudflare 完結方針）
-- 最終更新: 2026-11-10
+- 最終更新: 2026-11-11
 
 ---
 
@@ -18,6 +18,8 @@
 
 本書では、**初期インポートは S3 スナップショットから一括抽出し、日々の差分は OpenAlex API から取得する**という二系統の取り込み方式に設計変更する。これに伴う ARCHITECT.md 3.1 の置き換えとして本書を位置づける。
 
+**取り込み範囲の変更（2026-11-11）**: 取り込み範囲を直近 10 年（2016〜2026）から **2006 年以降の約 20 年（2006〜2026）** に広げ、D1 を **5 年単位**（`field17_2006_2010` / `field17_2011_2015` / `field17_2016_2020` / `field17_2021_2025` / `field17_2026_2030`）に分割する（SPEC 4.3、ARCHITECT.md 3.4.2）。以下の「約609万件」は直近 10 年（2016〜2026）の P0-1 実測値であり、2006 年以降の件数は段階③・④で実測する。
+
 ### 1.1 方針転換の要点
 
 | 項目 | 旧方針（ARCHITECT.md 3.1） | 新方針（本書） |
@@ -25,7 +27,8 @@
 | 初期データ | OpenAlex API（cursor paging、N=50,000件に限定） | S3 スナップショット（Parquet）から分野・年で絞り込み全件抽出 |
 | 実行場所 | Cloudflare Workflows（Cloudflare 上で完結） | ローカル PC または EC2 インスタンス（データ量次第）でオフライン抽出 → D1 へ投入 |
 | 差分更新 | （初期取り込みと同じ Workflow を日次実行） | OpenAlex API（`from_updated_date` 等）を使い、スナップショット取得日以降の更新分のみ取得 |
-| 取り込み件数 | N=50,000件（被引用上位のみ）に限定 | 分野・年で絞り込んだ全件（約609万件規模を想定） |
+| 取り込み件数 | N=50,000件（被引用上位のみ）に限定 | 分野17・2006年以降の全件（2016年以降だけで約609万件。20年分の件数は要実測） |
+| D1 の分割 | `field17_2016_2026` の 1 DB | 5 年単位の 5 DB（2006-2010 〜 2026-2030） |
 
 ### 1.2 非ゴール
 
@@ -43,14 +46,14 @@
       │  DuckDB httpfs 拡張で S3 を直接読む（ダウンロードしない）
       ▼
   ローカル PC または EC2 インスタンス（帯域次第で選択）
-      │  DuckDB で分野・年を絞り込み抽出（extract_cs.py を拡張）
-      │    - papers.csv / edges.csv（または parquet）を生成
+      │  scripts/ingest/stage.py: ファイルごとに分野・年で絞り込み → 中間 Parquet
+      │  scripts/ingest/build.py: 結合・重複除去・5年単位の DB ごとに papers/edges/... を生成
       ▼
   D1 への一括投入
       │  wrangler d1 execute --file（SQLite dump）
       │  または Workers から chunk 分割 INSERT
       ▼
-  D1（field17_2016_2026 ほか、年代分割後は複数 DB）
+  D1（field17_2006_2010 〜 field17_2026_2030 の 5 DB）
 
 [差分更新（日次、Cloudflare 上で継続）]
   Cron Trigger
@@ -98,19 +101,20 @@ S3 スナップショットからの抽出・D1 投入は、スクリプト改�
 | **① 抽出スクリプトの動作確認** | `--limit-files` で 1〜数ファイルに限定 | httpfs 経由の S3 読み込み・列拡張（3.3 の追加検討事項）が正しく動くか確認。ダウンロード不要の確認も含む | `papers.csv`/`edges.parquet` が期待する列・形式で出力される |
 | **② 小規模 D1 投入の確認** | ①の出力（数千件規模） | D1 投入方式（3.4）・投入順序（papers→edges→child_cnt）が正しく動くか、既存の `recomputeChildCnt` と整合するかを確認 | 件数一致・`child_cnt` 不一致 0 件（3.6 と同じ検証を小規模データで実施） |
 | **③ 一部分野・一部年代での中規模実行** | 分野17・直近1〜2年分など、本番の一部 | 本番規模に近いデータで処理時間・D1サイズ・エッジ密度の見積もりを実測し、本番実行の計画（実行場所・バッチサイズ・所要時間）を確定する | 処理時間・出力サイズが見積もり通りか確認。EC2が必要かどうかの判断もここで行う |
-| **④ 本番実行（全件）** | 分野17・直近10年の全件 | 3.1〜3.6 の手順通り、本番データを一括投入する | 3.6 の検証項目を満たす |
+| **④ 本番実行（全件）** | 分野17・2006年以降の全件 | 3.1〜3.6 の手順通り、本番データを一括投入する | 3.6 の検証項目を満たす |
 
 - ①〜③は同じローカル PC で実施できる想定（データ量が小さいため、2.1 のネットワーク帯域問題は発生しにくい）。③の実測結果を見て、④をローカル PC で続けるか EC2 に切り替えるかを決める。
 - ②・③で D1 に投入したテストデータは、④の本番投入前に削除する（`DELETE FROM papers; DELETE FROM edges;` 等）か、④を別の D1 データベースに対して行い検証後に本番 DB を切り替える。どちらの方式を取るかは③の結果を見て決める（5章の未確定事項に記載）。
-- 各段階の完了をもって次段階に進む。①の時点で列不足（`fwci`/`subfield`/`doi` 等）やスキーマ不整合が見つかれば、そこで `extract_cs.py` を修正し、②以降はやり直す。
+- 各段階の完了をもって次段階に進む。①の時点で列不足やスキーマ不整合が見つかれば、そこで `scripts/ingest/` を修正し、②以降はやり直す。
+- 段階①は完了（2026-11-11、3.3 末尾の実測を参照）。
 
 ### 3.1 対象ファイルの選定
 
 `data/openalex/manifest.json` の `files[].url` は `s3://openalex/data/parquet/works/updated_date={YYYY-MM-DD}/part_{NNNN}.parquet` の形式で、OpenAlex 側の「更新日」単位にパーティション分割されている。
 
-- **注意**: このパーティションは論文の `publication_year`（出版年）ではなく、OpenAlex 側のレコード更新日である。分野・出版年による絞り込みは、ファイルを選ぶ段階では行えず、**ファイルの内容を読んだ後に `WHERE` で絞り込む**必要がある。つまり原則として全 1,898 ファイルを読む対象にする必要がある（既存の `extract_cs.py` もこの前提で実装されている）。
+- **注意**: このパーティションは論文の `publication_year`（出版年）ではなく、OpenAlex 側のレコード更新日である。分野・出版年による絞り込みは、ファイルを選ぶ段階では行えず、**ファイルの内容を読んだ後に `WHERE` で絞り込む**必要がある。つまり原則として全 1,898 ファイルを読む対象にする必要がある（`scripts/ingest/stage.py` もこの前提で全ファイルを順に読む）。
 - ファイル単位の絞り込みで時間を短縮できる余地があるとすれば、「更新日が極端に古い（2016年頃）ファイルは件数が少ない」程度で、全件スキップには使えない。
-- 実務上は、DuckDB の `read_parquet(..., union_by_name=true)` に全ファイルの glob パターン（S3 の URL も glob 可）を渡し、一度のクエリで絞り込みと集計を行う（`extract_cs.py` と同方式）。これにより個々のファイルを明示的に選別する手間を省く。
+- 実装（`scripts/ingest/stage.py`）では、全ファイルを 1 クエリで読むのではなく `manifest.json` の URL を 1 ファイルずつ処理する。メモリ使用量をファイル単位に抑え、失敗時の再開を可能にするため。
 
 ### 3.2 S3 への接続（ダウンロードしない）
 
@@ -123,58 +127,88 @@ SET s3_endpoint = 's3.amazonaws.com';
 -- OpenAlex バケットは公開（認証不要）。Requester Pays でもない。
 ```
 
-```python
-# extract_cs.py 側でも、--pattern に S3 の URL を glob で渡せるようにする
-# 例: --pattern "s3://openalex/data/parquet/works/*/*.parquet"
-```
-
 - ネットワーク帯域が処理時間を左右する（2.1 参照）。回線が細い場合は EC2（3.5）に切り替える。
 - 動作確認は、まず `--limit-files` で少数ファイルに絞って S3 から正しく読めるか確認してから、全ファイルに対象を広げる。
 
-### 3.3 DuckDB での抽出
+### 3.3 DuckDB での抽出（`scripts/ingest/`）
 
-既存の `data/openalex/extract_cs.py` をベースに、以下を変更する。3.0 の段階①では `--limit-files` を付けて小規模に、段階④では外して全ファイルに対して実行する。
+検証用の `data/openalex/extract_cs.py` は使わず、`scripts/ingest/` に新規作成した 2 段構成のスクリプトで抽出する（2026-11-11）。実行マシンのメモリが小さくても（EC2 7.6 GB で確認）動くよう、S3 を読む段階と結合・集計する段階を分けている。
 
-- `--pattern` に S3 上の全ファイルの glob（例: `s3://openalex/data/parquet/works/*/*.parquet`）を渡す（3.2 参照、ローカルパスではなく S3 URL になる点が変更点）。
-- `--field 17 --min-year 2016` （分野17・直近10年、SPEC 4.3 準拠）で実行する。段階③では `--min-year` を直近1〜2年に絞るなど、対象範囲も縮小する。
-- 出力は `papers.csv` / `edges.parquet`（または `.csv`）とし、既存スクリプトの出力形式をそのまま使う。
-- 本番実行（段階④）の前に `--count` で絞り込み後の件数を確認し、想定（約609万件、P0-1 実測値）から大きく外れないかチェックする。
-- `external_ids.csv`（分野外から引用されている ID）は、SPEC 4.3「取り込み対象外の論文は祖先としてのみ必要な場合に限り追加」への対応候補として保持するが、PoC では当面使用しない（ARCHITECT.md 3.1 の簡略化方針を維持）。
+**Step 1: `stage.py`（S3 → 中間 Parquet）**
 
-**スクリプトへの追加検討事項**（本番実行前に対応）:
-- `publication_date`（月精度）・`doi`・`fwci` ・`subfield` 列は現状 `extract_cs.py` の抽出対象に含まれていない（`papers.csv` は `id, title, year, cit, field` のみ）。D1 スキーマ（SPEC 4.4、`migrations/0003`）は `year`（月精度の小数）・`fwci`・`subfield`・`doi` 列を持つため、スクリプトを拡張してこれらの列も抽出する必要がある。
-- `child_cnt` は現行スクリプトでは分野内の「直接の子の数」を別テーブルとして出している。D1 投入時は `papers` 行に `child_cnt` 列として結合するか、投入後に `UPDATE ... SET child_cnt = (SELECT COUNT(*) ...)`（既存の `recomputeChildCnt` と同じクエリ）を流す。
-- **keywords の辞書化**（SPEC 4.4、`migrations/0005`）: OpenAlex の `keywords` 列は `STRUCT(id, display_name, score)[]`（Parquet 実データで確認済み、2026-11-10）であり、1論文あたり平均4.5件・最大22件のキーワードを持つ（分野17・直近10年相当のサンプルで実測）。D1 は配列を直接扱えないため、`keywords`（辞書: id, name）+ `paper_keywords`（中間テーブル: paper_id, keyword_id, score）に正規化する。DuckDB では `UNNEST` で展開してから集計する:
-  ```sql
-  -- 辞書（重複キーワードを除いた一意な id/name の組）
-  CREATE TABLE keywords AS
-  SELECT DISTINCT
-      regexp_extract(kw.id, 'keywords/([^/]+)$', 1) AS id,
-      kw.display_name AS name
-  FROM (SELECT unnest(keywords) AS kw FROM papers_raw);
+```bash
+python3 scripts/ingest/stage.py --limit-files 3   # 段階①: 更新日の新しい順に 3 ファイル
+python3 scripts/ingest/stage.py --min-year 2021   # 段階③: 一部の年代
+python3 scripts/ingest/stage.py                   # 段階④: 全 1,898 ファイル（既定 --field 17 --min-year 2006 --max-year 2026）
+```
 
-  -- 中間テーブル（論文×キーワード）
-  CREATE TABLE paper_keywords AS
-  SELECT
-      id AS paper_id,
-      regexp_extract(kw.id, 'keywords/([^/]+)$', 1) AS keyword_id,
-      kw.score AS score
-  FROM (SELECT id, unnest(keywords) AS kw FROM papers_raw);
-  ```
-  - 辞書テーブル（`keywords`）は OpenAlex 全体で語彙が有限（概算で数万語）のため小さく、分野・年代で DB を分割しても重複を気にせず複製してよい。
-  - `paper_keywords` は論文数に比例して増える（609万件 × 平均4.5件 ≈ 2,700万行規模を想定）。`WITHOUT ROWID` + 複合主キー（`migrations/0005`）で容量を抑える。D1 の容量試算（ARCHITECT.md 3.4.1）に `paper_keywords` 分も加味する必要がある（本書 3.6 の検証で実測する）。
+- `data/openalex/manifest.json` の S3 URL を 1 ファイルずつ DuckDB httpfs で直接読み（ダウンロードなし、必要な列だけを Range 読み）、`primary_topic.field.id` と `publication_year` で絞り込んで `data/openalex/work/stage/{updated_date}__{part}.parquet` に書く。
+- 一時ファイルに書いてから rename するため、出力済みのファイルはスキップして途中から再開できる。読み込み失敗は再試行する（既定 3 回）。
+- 前回と異なる条件（分野・年範囲）で再実行すると、新旧の条件が混ざらないよう停止する（`stage_params.json` で判定）。
+- 変換内容:
+  - `id`: `https://openalex.org/W123` → `123`（BIGINT）
+  - `title`: 空・NULL は `(no title)`（D1 の NOT NULL 制約、既存 Workflow と同じ）
+  - `year`: `publication_year + (month(publication_date) - 1) / 12`。`publication_date` 欠損時は `worker/ingest-workflow.ts` の `yearWithMonth` と同じく id から決定的に月を割り当てる
+  - `subfield`: `primary_topic.subfield.id` の数値部分。`fwci`・`doi`・`cited_by_count` はそのまま
+  - `referenced_works` → 数値 ID の配列、`authorships[].author.display_name` → 著者名の配列、`keywords` → `{id(スラッグ), name, score}` の配列
+
+**Step 2: `build.py`（中間 Parquet → DB ごとの D1 投入用テーブル）**
+
+```bash
+python3 scripts/ingest/build.py   # 出力: data/openalex/work/out/{DB名}/{table}.parquet, out/stats.json
+```
+
+- 同じ id が複数ファイルにある場合は `updated_date` が最新の行を採用する。
+- 論文の所属 DB を出版年で決め、5 年単位（2006-2010, 2011-2015, 2016-2020, 2021-2025, 2026-2030）に分けて出力する（SPEC 4.3、ARCHITECT.md 3.4.2）。
+- 出力テーブル（migrations 0001〜0005 と同じ列）:
+  - `papers`: id, field, title, year, cit, fwci, subfield, child_cnt, doi
+  - `edges`: cited が取り込んだ全年代の `papers` のどこかに存在するものだけ。**citing 側の DB に置く**（SPEC 4.4 の結合ルール）。自己引用は除外
+  - `authorships`: paper_id, author_name（論文内の重複は除く）
+  - `paper_keywords`: paper_id, keyword_id, score / `keywords`: その DB の `paper_keywords` が参照する語だけ
+- `child_cnt` は**全年代の edges から計算**する（DB をまたぐ子も数える）。DB 単体で `recomputeChildCnt`（`UPDATE papers SET child_cnt = (SELECT COUNT(*) FROM edges WHERE cited = papers.id)`）を流すと、後の年代 DB にある子が数えられず値が小さくなるため、日次差分側のロジックも合わせて変更する必要がある（4.3）。
+- 中間計算は `data/openalex/work/build.duckdb`（ディスク）で行い、メモリに載らない分は `data/openalex/work/tmp` にスピルする（既定 `--memory-limit 5GB`）。
+- 抽出時点の整合性チェック（NOT NULL 違反、年代外の論文、DB 内に citing が無いエッジ、辞書に無い keyword_id、`child_cnt` 合計とエッジ総数の差）を `stats.json` に出力する。
+
+**段階①の実測（2026-11-11、EC2 上、更新日 2026-10-14 の 3 ファイル 2.2 GB）**
+
+- stage: 約 14 秒（S3 読み込み 約 160 MB/s）。全 744 GB でも 1〜2 時間程度の見込み → ローカル PC ではなく EC2 で本番まで実行できる見込み。
+- 論文 42,337 件・edges 4,768（うち約 61% が cited を別の年代 DB に持つ）・チェック項目はすべて 0。
+- keywords の語彙は 3 ファイルだけで 8.3 万語あり、当初の「全体で数万語」という見積もりより大きい。
+- `publication_date` が 1 月の論文が約 27% と多い（OpenAlex 側で月不明の論文が 1/1 になっていると思われる）。
 
 ### 3.4 D1 への投入
 
-データ量が大きいため、Workers 経由のバッチ INSERT（既存の `upsertPapers`/`upsertEdgesFromRaw` と同じ方式）は現実的でない（数百万〜1千万行規模になると、HTTP 経由のバッチ投入では時間がかかりすぎる）。以下のいずれかを使う。
+データ量が大きいため、Workers 経由のバッチ INSERT（既存の `upsertPapers`/`upsertEdgesFromRaw` と同じ方式）は使わず、**SQL ファイルを生成して `wrangler d1 execute --file` で投入する**（2026-11-11 採用。ローカル D1 で動作確認済み）。
 
-1. **`wrangler d1 execute --file`**（第一候補）: CSV/Parquet から SQLite の `INSERT` 文（または `.import` 相当）を生成し、SQL ファイルとして投入する。ARCHITECT.md 3.4 で「最大 5 GB」までの一括インポートの選択肢として既に挙がっている。
-   - DuckDB から直接 SQLite ファイルを生成できる（`ATTACH 'out.sqlite' AS sq (TYPE sqlite); CREATE TABLE sq.papers AS SELECT * FROM papers;` 等）。生成した SQLite ファイルを `wrangler d1 execute --file` で読み込ませる、または [D1 のインポート機能](https://developers.cloudflare.com/d1/best-practices/import-export-data/)（`wrangler d1 export`/`import` 相当）を使う。
-   - 大きい場合はテーブル単位・チャンク単位で SQL ファイルを分割し、順次実行する。
-2. **R2 経由 + Worker 側バッチ処理**（代替案）: 抽出した CSV/Parquet を R2 にアップロードし、1 回限りの投入用 Worker スクリプト（またはローカルから `wrangler d1 execute` を繰り返し呼ぶスクリプト）で chunk 分割 INSERT を行う。既存の `BATCH_CHUNK_SIZE=500`、`SQL_IN_CHUNK_SIZE=90`（D1 のバインド変数上限）の制約を踏まえて実装する。
-3. 件数・ファイルサイズを実測した上で、どちらを採用するか決定する。目安として D1 の 1 データベース上限は 10 GB、行サイズ上限は 2 MB。**3.0 の段階②（小規模データ）でまず一方を試し、動作確認できた方式を段階③・④でも使う。**
+**Step 3: `export_sql.py`（Parquet → SQL ファイル）**
 
-投入順序は既存 Workflow と同じ依存関係を守る: `papers` を先に全件投入 → `edges` を `cited` 側が `papers` に存在するものだけ投入 → `child_cnt` を再計算。`keywords`（辞書）・`paper_keywords`（中間テーブル）はこの順序と独立しているため、`papers` 投入後であればどのタイミングでも投入してよい（`paper_keywords.paper_id` が `papers.id` に存在することだけ保証する）。
+```bash
+python3 scripts/ingest/export_sql.py   # 出力: data/openalex/work/sql/{DB名}/{NN}_{table}_{part}.sql
+```
+
+- 1 文あたり最大 90 KB の複数行 INSERT にまとめる（D1 の SQL 文長上限 100 KB 未満）。1 ファイルあたり最大 100 MB で分割する。
+- ファイル名の番号が投入順: `01_papers` → `02_edges` → `03_authorships` → `04_keywords` → `05_paper_keywords`。
+- 主キーのあるテーブルは `INSERT OR REPLACE`（同じファイルを再投入しても重複しない）。`authorships` は主キーが無いため、空のテーブルへの投入を前提とする。
+- 補足: 「DuckDB で SQLite ファイルを生成して `wrangler d1 execute --file` で読み込む」案は採らない（`--file` が受け付けるのは SQL 文のファイルで、SQLite のデータベースファイルではないため）。
+
+**Step 4: `load_d1.py`（SQL ファイル → D1、検証）**
+
+```bash
+python3 scripts/ingest/load_d1.py --local --config <検証用 wrangler 設定>   # ローカル D1 で試す
+python3 scripts/ingest/load_d1.py --remote                                 # 本番 D1（wrangler.jsonc に登録済みの DB）
+python3 scripts/ingest/load_d1.py --remote --only field17_2006_2010        # DB を指定
+python3 scripts/ingest/load_d1.py --remote --verify-only                   # 検証だけ
+```
+
+- 投入先は `sql/` のフォルダ名と同じ名前の D1（事前に作成し、migrations 0001〜0005 を適用しておく）。
+- 投入前に各テーブルが空であることを確認し、空でなければ停止する（誤った二重投入を防ぐ）。
+- 投入後、3.6 の検証（件数・`child_cnt` 合計・被引用数合計を build の出力と照合、DB 内の参照整合性）を行う。
+
+投入順序は既存 Workflow と同じ依存関係を守る（`papers` → `edges` → その他）。`child_cnt` は build 時に全年代の edges から計算済みのため、投入後の再計算は行わない（DB 単体で再計算すると DB をまたぐ子が数えられず値が変わる。3.3 参照）。
+
+**本番規模での注意**: 本番（段階④）では 1 DB あたり数 GB 規模の SQL ファイルになる見込み。D1 のインポート上限・所要時間・投入中の DB の応答性は段階③で実測し、必要ならファイル分割サイズやインデックスの作成タイミング（投入後に作成するなど）を見直す。
+
+**段階②の実績（2026-11-11）**: 3 ファイル分（論文 42,337 件）を 5 DB に投入し、ローカル D1・本番 D1 とも全項目で一致した（本番は約 1 分半）。本番 D1 のサイズは合計約 54 MB（論文 1 件あたり約 1.3 KB。edges はサンプルでは両端が揃いにくく少ないため、全件時は edges 分が上乗せになる）。
 
 ### 3.5 EC2 を使う場合の構成（データ量次第）
 
@@ -183,9 +217,10 @@ SET s3_endpoint = 's3.amazonaws.com';
 - **リージョン**: OpenAlex の S3 バケットと同一（`us-east-1`）を選ぶ。httpfs 経由の読み込みでも、同リージョンなら帯域が太く・レイテンシが低く、S3→EC2 の転送料もかからない（これが EC2 を使う主な理由。2.1 参照）。
 - **インスタンスタイプ**: DuckDB 処理はメモリと（httpfs の場合は）ネットワークスループットが支配的。メモリ最適化系（例: `r6i`/`r7i` 系）を候補とし、必要メモリ量（抽出対象の中間データサイズ）を見て決める。ダウンロードを行わないため、ローカル NVMe の太さは必須要件ではない。具体的なインスタンスタイプ・サイズは実行時点の価格・在庫を見て選定する（本書では固定しない）。
 - **ストレージ**: ダウンロードしないため、EBS は 2.2 の見積もり（**200〜400 GB 程度**、DuckDB の一時スピル領域 + 出力ファイル）で足りる。744 GB 規模のダウンロード用ストレージは不要。
-- **セットアップ**: Amazon Linux 2023 等に Python 3・`duckdb`（pip、httpfs 拡張同梱）をインストールする最小構成。`awscli` は S3 からのダウンロードをしないため必須ではないが、出力を S3 経由でやり取りする場合は入れておく。既存の `extract_cs.py` をそのまま転送して実行する。
+- **セットアップ**: Amazon Linux 2023 等に Python 3・`duckdb`（pip、httpfs 拡張同梱）をインストールする最小構成。`awscli` は S3 からのダウンロードをしないため必須ではないが、出力を S3 経由でやり取りする場合は入れておく。リポジトリの `scripts/ingest/` を実行する。
+- **実績（2026-11-11）**: 段階①は EC2（2 vCPU・メモリ 7.6 GB・EBS 500 GB、Amazon Linux 2023、Python 3.9、duckdb 1.4.5）で実行した。
 - **運用**:
-  - 起動 → `extract_cs.py` を S3 URL 指定で実行（3.2〜3.3） → 出力（`papers.csv`/`edges.parquet` 等）を S3 または R2 にアップロード → **インスタンスを終了（Terminate、課金停止）**。
+  - 起動 → `scripts/ingest/stage.py` → `build.py` を実行（3.2〜3.3） → 出力（`papers.csv`/`edges.parquet` 等）を S3 または R2 にアップロード → **インスタンスを終了（Terminate、課金停止）**。
   - 本書では IaC 化・自動終了の仕組みは範囲外とする。手動でのインスタンス終了を徹底する（課金継続の事故を避けるため、作業完了後すぐに終了することをチェックリスト化する）。
   - R2 へのアップロードは `aws s3 cp`（S3 互換 API）または Cloudflare の R2 API で行い、ローカル PC を経由せず EC2 → R2 で完結させる。
 - **コスト感覚**: スポットインスタンスではなくオンデマンドで数時間程度の使用を想定（ダウンロード工程がないため、ダウンロード方式より短くなる見込み）。長時間かかる見込みが事前に判明した場合は、抽出ロジック（DuckDB のクエリ最適化、`--threads` 増加、必要列のみ読む）を先に見直す。
@@ -194,11 +229,11 @@ SET s3_endpoint = 's3.amazonaws.com';
 
 以下は段階③・④（3.0）で共通して行う検証。段階②（小規模）でも件数一致・`child_cnt` 一致の2点は同様に確認する。
 
-- 抽出した論文数・エッジ数が、想定件数（段階④なら P0-1 実測の約609万件、段階③ならその年代の `--count` 結果）と大きくズレていないか確認する。
+- 抽出した論文数・エッジ数が、想定件数（段階④なら OpenAlex API の `meta.count`（`primary_topic.field.id:17,from_publication_date:2006-01-01`）、段階③ならその年代の `meta.count`）と大きくズレていないか確認する。
 - D1 投入後、`SELECT COUNT(*) FROM papers` / `edges` / `paper_keywords` が抽出時の件数と一致することを確認する。
-- `child_cnt` を再計算し、既存 Workflow 実装と同じロジック（`recomputeChildCnt`）で不一致がないか確認する（P1-5 と同様の検証）。
+- `child_cnt` が全 DB の edges から数えた直接の子の数と一致することを確認する（DB をまたぐ子を含むため、DB 単体の `recomputeChildCnt` とは一致しない。3.3 参照）。
 - `paper_keywords.keyword_id` が `keywords.id` に存在すること（外部キー相当の整合性）、`paper_keywords.paper_id` が `papers.id` に存在することを確認する（D1 は外部キー制約を強制しないため、投入後に `SELECT` で明示的に検証する）。
-- ARCHITECT.md 3.4.1 の容量試算（直近10年・全件規模で約6〜9 GB）と実測値を比較し、年代分割（3.4.2）の着手が必要かここで判断する（段階④で判断。段階③は参考値として記録）。`paper_keywords`（609万件×平均4.5件≈2,700万行想定）の実測サイズもここで確認し、3.4.1 の試算に加味する。
+- 各年代 DB の実測サイズが 10 GB 上限に対して十分な余裕があるか確認する（ARCHITECT.md 3.4.1 の試算は直近10年・1 DB で約6〜9 GB。5 年単位分割後は 1 DB あたりおおむねその半分以下の見込み）。余裕がなければ区切り幅（5年→3年など）を見直す（ARCHITECT.md 3.4.2）。`paper_keywords`・`authorships` の実測サイズもここで確認する。
 
 ---
 
@@ -232,11 +267,12 @@ ARCHITECT.md 3.1 と同様、Cron Trigger による日次実行を基本とす�
 ## 5. 未確定事項
 
 1. **実行場所の最終決定（ローカル PC か EC2 か）**: httpfs 経由の読み込みがローカル回線の帯域で現実的な時間に収まるか試してから決める（2.1 参照）。ディスク容量はどちらでも 200〜400 GB 程度で足りるため、決定要因は帯域・レイテンシのみ。
-2. **D1 投入方式（`wrangler d1 execute --file` か Worker 経由チャンク投入か）**: 実際の抽出データ量を見てから決める（3.4 参照）。
-3. **年代分割（ARCHITECT.md 3.4.2）の着手タイミング**: 初期インポートで全件規模（約609万件）を取り込んだ時点の実測 D1 サイズを見て判断する。
+2. ~~**D1 投入方式**~~ → `wrangler d1 execute --file`（SQL ファイル）を採用（2026-11-11、3.4）。本番規模での所要時間は段階③で実測する。
+3. ~~**年代分割（ARCHITECT.md 3.4.2）の着手タイミング**~~ → 初期インポートから 5 年単位で分割する（2026-11-11 決定）。区切り幅が妥当かは段階④の実測 D1 サイズで確認する。
 4. **`from_updated_date` フィルタの実際の挙動**: 1日あたりの更新件数・ページ数を小規模リクエストで確認する（Rate Limiter DO の既存実装がそのまま使えるか含め検証）。
 5. **撤回・削除された論文の扱い**: OpenAlex 側の変更をどう検知し、D1 側にどう反映するか（PoC では対応しない選択肢も含めて検討）。
-6. **`extract_cs.py` の拡張範囲**: `publication_date`（月精度）・`fwci`・`subfield`・`doi` 列の抽出、および `child_cnt` の結合方法を実装する（3.3 参照）。
+6. ~~**`extract_cs.py` の拡張範囲**~~ → `scripts/ingest/` を新規作成して対応済み（2026-11-11、3.3）。
+8. **DB をまたぐ処理**: edges の約 6 割は cited が別の年代 DB にある。系統樹・系譜追跡（`worker/graph.ts`）の DB 横断結合（ARCHITECT.md 3.4.0 で未実装）と、日次差分での `child_cnt` 更新（DB をまたぐ子を数える方法）を設計する必要がある。
 7. **段階②・③（3.0）のテストデータの後始末方法**: 本番の D1 に対して小規模・中規模データをそのまま投入して検証するか、別の D1 データベース（例: 検証用に新規作成）に対して行うかを決める。前者なら本番投入前に `DELETE` で消す手順を確立する必要があり、後者なら検証用 D1 の作成・破棄の手順を決める必要がある。
 
 ---

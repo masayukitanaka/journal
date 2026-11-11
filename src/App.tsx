@@ -16,6 +16,10 @@ function App() {
 	const [graph, setGraph] = useState<SeedGraph>(SAMPLE_GRAPH);
 	const [isSample, setIsSample] = useState(true);
 	const [loadError, setLoadError] = useState<string | null>(null);
+	// 分野・年代の切り替え時、top/hubs/シードグラフの再取得が終わるまでの読み込み中フラグ
+	// （2026-11-11。切り替え後にグラフが切り替わるまで数秒かかることがあり、何も起きていないように
+	// 見えて分かりにくいとのユーザー指摘を受けて追加。グラフ表示エリアにスピナーを重ねる）。
+	const [isLoadingGraph, setIsLoadingGraph] = useState(false);
 
 	// 分野・年代の切り替え（D1 を分野・年代レンジで分割する方針、ARCHITECT.md 3.4.2 に対応）。
 	// 選択肢自体は /api/fields から取得する（worker/db.ts の DB_REGISTRY が真実の情報源）。
@@ -79,6 +83,7 @@ function App() {
 		setCollapsedIds(new Set());
 		setLineage([]);
 		setSelectedPaper(null);
+		setIsLoadingGraph(true);
 
 		async function load() {
 			try {
@@ -101,6 +106,8 @@ function App() {
 				if (!cancelled) {
 					setLoadError(err instanceof Error ? err.message : String(err));
 				}
+			} finally {
+				if (!cancelled) setIsLoadingGraph(false);
 			}
 		}
 
@@ -300,7 +307,7 @@ function App() {
 				onTogglePanel={() => setPanelOpen((v) => !v)}
 			/>
 			<div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-				<main style={{ flex: 1, minWidth: 0 }}>
+				<main style={{ flex: 1, minWidth: 0, position: "relative" }}>
 					<GraphView
 						nodes={visibleNodes}
 						edges={visibleEdges}
@@ -313,6 +320,24 @@ function App() {
 						mainYearRange={mainYearRange}
 						focusRequestId={viewFocusRequestId}
 					/>
+					{isLoadingGraph && (
+						<div
+							style={{
+								position: "absolute",
+								inset: 0,
+								display: "flex",
+								flexDirection: "column",
+								alignItems: "center",
+								justifyContent: "center",
+								gap: 12,
+								background: "var(--graph-bg)",
+								opacity: 0.85,
+							}}
+						>
+							<div className="loading-spinner" />
+							<div style={{ fontSize: 13, color: "var(--muted-text)" }}>Loading...</div>
+						</div>
+					)}
 				</main>
 				{panelOpen && (
 					<SidePanel

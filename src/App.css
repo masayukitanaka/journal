@@ -255,3 +255,19 @@ body {
 	box-sizing: border-box;
 	padding-left: 32px;
 }
+
+/* 分野・年代切り替え時の読み込み中オーバーレイ（2026-11-11）。 */
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+.loading-spinner {
+	width: 28px;
+	height: 28px;
+	border: 3px solid var(--border-color);
+	border-top-color: var(--accent);
+	border-radius: 50%;
+	animation: spin 0.7s linear infinite;
+}
