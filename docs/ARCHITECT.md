@@ -122,7 +122,11 @@ SPEC 4.4 のスキーマをそのまま採用する。Cloudflare 完結化に伴
 - **新しい DB を追加する手順**: ① `wrangler d1 create` で DB 作成 → ② `wrangler.jsonc` に binding 追加 → ③ `wrangler types` で `Env` 型を再生成 → ④ `DB_REGISTRY` に 1 行追加。
 - **API ルーティング**: 5 章の全エンドポイントが `/api/fields/:field/...` のパスパラメータで分野を受け取り、`yearRange` クエリパラメータ（`"2016-2026"` 形式、省略時はその分野の既定レンジ）で年代を指定する。`worker/db.ts` の `resolveFieldDb()` が両パラメータを検証し、対応する `D1Database` を返す（未登録の組み合わせは 404）。
 - **フロントエンド**: `GET /api/fields` で登録済みの分野・年代レンジ一覧を取得し、ヘッダーのセレクトボックス（`src/components/Header.tsx`）で切り替える。切り替えると `src/App.tsx` がグラフ・一覧・選択状態を全て再読み込みする（別 DB のデータのため、選択 ID 等は引き継がない）。
-- **複数 DB をまたぐクエリ**（例: 年代分割後の系譜追跡が DB をまたぐ場合）は、4.4 の結合ルール（`UNION ALL`）に従う実装は未着手（2026-11-10 時点ではレジストリ・切り替え基盤のみ。実際に年代分割が必要になった時点で対応する）。
+- **年代境界をまたぐ系譜の補完（2026-11-11 実装）**: S3 ingest による実データ投入後、実際に年代境界をまたぐ引用関係が存在することを確認した（`field17_2021_2025` で、祖先が別 DB にいるエッジが 1,950 件）。4.4 の結合ルール通り、edges は citing 側の DB に保存されるため、祖先（cited）が「1つ前の年代レンジ」の DB にいることがある。全登録 DB を毎回 `UNION ALL` する本格対応ではなく、**前後1年代レンジ分の「隣接 DB」だけを追加で検索する最小対応**を実装した。
+  - `worker/db.ts` の `listAdjacentDbs(env, field, yearRange)` が、現在の年代レンジの `end+1` や `start-1` に一致する隣接レンジの DB を返す。
+  - `worker/graph.ts` の `buildSeedGraph()` に `adjacentDbs` 引数を追加。BFS で論文情報が見つからない ID は隣接 DB からも探す（`fetchPapersWithAdjacent`）。子孫方向のエッジ探索（`column="cited"`）も隣接 DB を見る（`fetchEdgesChunkedWithAdjacent`）。祖先方向のエッジ探索（`column="citing"`）は frontier ノードが現在の DB にいる前提上、常に現在の DB 内で完結するため隣接 DB 検索は不要。
+  - `worker/api/paper.ts` の `resolveLineage()`（系譜・祖先の列）も同様に隣接 DB を検索するよう変更。
+  - **未対応**: 2レンジ以上離れた年代をまたぐ系譜（例: 2021-2025 から 2011-2015 への直接の祖先）は補完されない。登録済み全 DB を横断する本格対応（4.4 の `UNION ALL` 方針）は引き続き未着手。
 
 #### 3.4.1 なぜ「分野だけ」では不十分か（容量試算）
 

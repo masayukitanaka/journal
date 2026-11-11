@@ -18,6 +18,7 @@ export interface GraphNode {
 	t: string; // 論文名
 	c: number; // 被引用数
 	k: number; // 分岐数
+	a?: boolean; // 隣接する年代レンジの DB から補完されたノードか（2026-11-11、省略時/false はメイン DB 由来）
 }
 
 export interface SeedGraph {
@@ -28,7 +29,14 @@ export interface SeedGraph {
 	edges: [number, number][];
 }
 
+export interface KeywordInfo {
+	name: string;
+	score: number | null;
+}
+
 export interface PaperDetail {
 	paper: PaperSummary;
 	lineage: PaperSummary[];
+	authors: string[];
+	keywords: KeywordInfo[];
 }

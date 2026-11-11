@@ -32,16 +32,34 @@ interface DbRegistryEntry {
 }
 
 // 分野・年代レンジ → D1 binding 名の対応表。新しい DB を追加したらここに 1 行足す。
+// 先頭に書いたエントリが、yearRange 未指定時のその分野の既定値になる（resolveDb 参照）。
+// field17_2021_2025 を既定にする（2026-11-11、S3 ingest で実データが投入済み。実データの無い
+// 旧 DB field17_2016_2026 は wrangler.jsonc の binding は残すがレジストリからは外してある）。
 const DB_REGISTRY: DbRegistryEntry[] = [
-	{ field: 17, yearRange: { start: 2016, end: 2026 }, binding: "DB_FIELD17_2016_2026" },
+	{ field: 17, yearRange: { start: 2021, end: 2025 }, binding: "DB_FIELD17_2021_2025" },
+	{ field: 17, yearRange: { start: 2006, end: 2010 }, binding: "DB_FIELD17_2006_2010" },
+	{ field: 17, yearRange: { start: 2011, end: 2015 }, binding: "DB_FIELD17_2011_2015" },
+	{ field: 17, yearRange: { start: 2016, end: 2020 }, binding: "DB_FIELD17_2016_2020" },
+	{ field: 17, yearRange: { start: 2026, end: 2030 }, binding: "DB_FIELD17_2026_2030" },
 ];
 
 export function listFields(): number[] {
 	return [...new Set(DB_REGISTRY.map((e) => e.field))].sort((a, b) => a - b);
 }
 
+// 年代順（開始年の昇順）に並べて返す。DB_REGISTRY 自体の並び順は「既定値（先頭）が分かりやすい」
+// ことを優先しているため登録順はバラバラだが、UI の選択肢は年代順の方が分かりやすい（2026-11-11）。
 export function listYearRanges(field: number): YearRange[] {
-	return DB_REGISTRY.filter((e) => e.field === field).map((e) => e.yearRange);
+	return DB_REGISTRY.filter((e) => e.field === field)
+		.map((e) => e.yearRange)
+		.sort((a, b) => a.start - b.start);
+}
+
+// yearRange 未指定時に実際に使われる既定レンジ（DB_REGISTRY のその分野の先頭エントリ）。
+// フロントの初期表示でドロップダウンを実際に読み込んだデータと一致させるために使う
+// （2026-11-11、/api/fields のレスポンスに含める）。
+export function listDefaultYearRange(field: number): YearRange | null {
+	return DB_REGISTRY.find((e) => e.field === field)?.yearRange ?? null;
 }
 
 // "2016-2026" の形式の文字列を YearRange にパースする。
@@ -55,12 +73,20 @@ export function formatYearRange(range: YearRange): string {
 	return `${range.start}-${range.end}`;
 }
 
+// 分野・年代レンジに対応するレジストリのエントリを返す（yearRange も含む。null はレジストリに無い場合）。
+// yearRange 省略時は、その分野で登録されている最初の（通常は唯一の）レンジを使う。
+function resolveDbEntry(field: number, yearRange?: YearRange): DbRegistryEntry | null {
+	return (
+		(yearRange
+			? DB_REGISTRY.find((e) => e.field === field && e.yearRange.start === yearRange.start && e.yearRange.end === yearRange.end)
+			: DB_REGISTRY.find((e) => e.field === field)) ?? null
+	);
+}
+
 // 分野・年代レンジに対応する D1 データベースを返す。レジストリに無ければ null。
 // yearRange 省略時は、その分野で登録されている最初の（通常は唯一の）レンジを使う。
 export function resolveDb(env: Env, field: number, yearRange?: YearRange): D1Database | null {
-	const entry = yearRange
-		? DB_REGISTRY.find((e) => e.field === field && e.yearRange.start === yearRange.start && e.yearRange.end === yearRange.end)
-		: DB_REGISTRY.find((e) => e.field === field);
+	const entry = resolveDbEntry(field, yearRange);
 	if (!entry) return null;
 	return env[entry.binding] as D1Database;
 }
@@ -72,30 +98,50 @@ export function db(env: Env): D1Database {
 	return found;
 }
 
+// 年代境界をまたぐ引用関係（SPEC.md 4.4「分野 DB の結合ルール」）への最小対応。
+// edges は citing 側の DB に保存されるため、祖先（cited）が 1 つ前の年代レンジの DB にいる
+// ケースがある（2026-11-11、field17_2021_2025 で実測 1,950 件）。登録済み全 DB を毎回横断するのではなく、
+// 前後 1 年代レンジ分だけを「隣接 DB」として返し、BFS がそこも検索できるようにする。
+export function listAdjacentDbs(env: Env, field: number, yearRange: YearRange): D1Database[] {
+	const adjacent: D1Database[] = [];
+	for (const entry of DB_REGISTRY) {
+		if (entry.field !== field) continue;
+		const isPrev = entry.yearRange.end === yearRange.start - 1;
+		const isNext = entry.yearRange.start === yearRange.end + 1;
+		if (isPrev || isNext) adjacent.push(env[entry.binding] as D1Database);
+	}
+	return adjacent;
+}
+
 export type ResolveFieldDbResult =
-	| { ok: true; db: D1Database; field: number }
+	| { ok: true; db: D1Database; field: number; yearRange: YearRange }
 	| { ok: false; status: 400 | 404; error: string };
 
 // API ルートの共通処理: パスパラメータ "field" を数値として検証し、対応する D1 を解決する。
 // yearRange クエリパラメータ（"2016-2026" 形式）が指定されていれば、そのレンジの DB を探す。
+// 戻り値の yearRange は、未指定時に実際に選ばれた既定レンジも含む（listAdjacentDbs に渡すため）。
 export function resolveFieldDb(env: Env, fieldParam: string, yearRangeParam?: string): ResolveFieldDbResult {
 	const field = Number(fieldParam);
 	if (!Number.isInteger(field) || field <= 0) {
 		return { ok: false, status: 400, error: "invalid 'field' path parameter" };
 	}
 
-	let yearRange: YearRange | undefined;
+	let yearRangeQuery: YearRange | undefined;
 	if (yearRangeParam !== undefined) {
 		const parsed = parseYearRange(yearRangeParam);
 		if (!parsed) {
 			return { ok: false, status: 400, error: "invalid 'yearRange' parameter (expected 'YYYY-YYYY')" };
 		}
-		yearRange = parsed;
+		yearRangeQuery = parsed;
 	}
 
-	const found = resolveDb(env, field, yearRange);
-	if (!found) {
-		return { ok: false, status: 404, error: `no database registered for field=${field}${yearRange ? ` yearRange=${formatYearRange(yearRange)}` : ""}` };
+	const entry = resolveDbEntry(field, yearRangeQuery);
+	if (!entry) {
+		return {
+			ok: false,
+			status: 404,
+			error: `no database registered for field=${field}${yearRangeQuery ? ` yearRange=${formatYearRange(yearRangeQuery)}` : ""}`,
+		};
 	}
-	return { ok: true, db: found, field };
+	return { ok: true, db: env[entry.binding] as D1Database, field, yearRange: entry.yearRange };
 }

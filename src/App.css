@@ -12,6 +12,7 @@
 	--warn-text: #92400e;
 	--lane-bg-even: rgba(0, 0, 0, 0.02);
 	--lane-bg-odd: rgba(0, 0, 0, 0.045);
+	--lane-bg-main: rgba(56, 189, 248, 0.14);
 
 	--surface: #ffffff;
 	--surface-raised: #ffffff;
@@ -42,6 +43,7 @@
 		--warn-text: #fde68a;
 		--lane-bg-even: rgba(255, 255, 255, 0.025);
 		--lane-bg-odd: rgba(255, 255, 255, 0.055);
+		--lane-bg-main: rgba(56, 189, 248, 0.16);
 
 		--surface: #16181d;
 		--surface-raised: #1c1f26;

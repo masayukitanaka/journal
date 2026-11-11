@@ -306,11 +306,13 @@
 - [ ] D1 容量の監視（10GB の 80% 等の閾値に近づいた場合のアラート運用、ARCHITECT 3.4.2）
 - [ ] Cloudflare の料金（D1 / R2 / Workflows / Queues / Workers Paid）が想定内に収まっているかの定期確認（SPEC 7 章「コスト」）
 
-### 既知の暫定措置（要クリーンアップ）
+### 既知の暫定措置（解消済み、履歴として記録）
 
-- **D1（papers/edges）が本番・ローカルとも 0 件になっている**（2026-11-10 時点で確認。原因未調査）。**方針変更（P1-0）** により、解消は次回の Ingest Workflow 実行ではなく、S3 スナップショットからの初期インポート（P1-0）の完了を待つことになった。
-- **R2 の `graph/field17/seed-2194775991-d2.json`（本番・ローカル両方）に、月単位レイアウト（X軸の月グリッド化）の見た目確認用として、`year` を手動で `year + ランダムな月/12` に書き換えたテストデータが入っている**（2026-11-10）。実際の OpenAlex 由来データではないため、このファイルを見ている間は分岐数・被引用数は正しいが出版年月が不正確。**方針変更（P1-0）** により、解消タイミングは初期インポート完了後に Graph Builder が同じシード・depth のグラフを再生成した時点になる。それまでは本番サイトでこのシード（Deep Residual Learning, id=2194775991, depth=2）を表示すると不正確な月が見える点に注意。
-- **本番 D1（`field17_2016_2026`）の `papers`/`edges` に、外部リンク機能（OpenAlex/DOI）の動作確認用テストデータ 3 件を手動投入している**（2026-11-10、id=2194775991 Deep Residual Learning, 2163605009 ImageNet classification, 639708223 Faster R-CNN。`doi` 列・`child_cnt` は概算値で実際の値とは異なる）。実際の OpenAlex データではないため、**方針変更（P1-0）** により、初期インポート（S3スナップショット由来）投入時に `ON CONFLICT` で正しい値に上書きされる想定。それまでは本番の `/api/fields/17/top` 等にこの3件が混じって見える。
+以下は EC2 からの初期インポート（P1-0）着手前に、本番 D1 の全データ削除（2026-11-11）と R2 テストデータ削除（2026-11-11）により解消済み。
+
+- ~~D1（papers/edges）が本番・ローカルとも 0 件になっている（2026-11-10 時点で確認。原因未調査）。~~ → 2026-11-11、EC2 からの初期インポート開始に備えて本番 D1（`papers`/`edges`/`authorships`）を全 DELETE し、マイグレーション 0005（`keywords`/`paper_keywords`）を適用済み。現在 5 テーブルすべて空かつ最新スキーマの状態（P1-0 の投入先として準備完了）。
+- ~~R2 の `graph/field17/seed-2194775991-d2.json` に、月単位レイアウト確認用のテストデータ（`year` を手動で書き換えたもの）が入っている。~~ → 2026-11-11、該当オブジェクトを削除済み。
+- ~~本番 D1 の `papers`/`edges` に、外部リンク機能（OpenAlex/DOI）動作確認用のテストデータ 3 件（id=2194775991, 2163605009, 639708223）が手動投入されている。~~ → 2026-11-11、上記の全 DELETE で解消済み。
 
 ### UI 整理（2026-11-10）
 
@@ -349,3 +351,80 @@
 - **`src/layout.ts`**: `layoutGraph()` を変更し、以前の「全ノードを子の被引用合計でグローバルにソート」ロジック（`computeChildCitationSum()`、削除済み）を廃止。代わりに `yearToMonthIndex()` で月ごとにノードをグループ化し、各グループ内を `node.t.localeCompare()` でソートしてから `yPos` を割り振る。
 - **動作確認**: ブラウザでホバーし、同じ月内のノードが "3D-R2N2" → "BranchyNet" のようにアルファベット順（記号・数字が先頭）で並ぶことを確認した。
 - **注記**: `publication_date`（月精度）は現在のテストデータにはほぼ含まれておらず大半が1月扱いになっているため、見た目は「各年1列」に近い。S3 ingest で実際の `publication_date` が入れば、月ごとの列に自然に分散される想定。
+
+### S3 ingest 完了・実データへの切り替え（2026-11-11）
+
+- **ユーザーが S3 ingest をやり直し**、5年単位の年代分割 DB（`field17_2006_2010`〜`field17_2026_2030`、計5つ）に実データを投入済み。`field17_2021_2025` には papers 19,760件・edges 3,306件・authorships 87,702件の実データが入っている（`publication_date` 月精度・`doi`・`authorships` とも正常）。
+- **`wrangler.jsonc`**: 新しい5つのD1 binding（`DB_FIELD17_2006_2010`〜`DB_FIELD17_2026_2030`）を追加。実データの無い旧 `DB_FIELD17_2016_2026` の binding は残置（削除はしていない）。
+- **`worker/db.ts`**: `DB_REGISTRY` を更新し、`field17_2021_2025` を分野17の既定（`yearRange` 未指定時に使われる）に設定。旧DBはレジストリから除外。
+- **動作確認**: `/api/fields` が5つの年代レンジを返すこと、`top`/`hubs`/`search`/`seed`/`paper` の全エンドポイントが実データを返すこと、著者名検索、DOIリンク、月精度のX軸配置をブラウザ実機で確認。本番へのデプロイはまだ行っていない（ユーザー判断待ち）。
+
+### 年代境界をまたぐ系譜の欠落と最小対応（2026-11-11）
+
+- **発覚の経緯**: ユーザーから「年代をまたいだ親子関係は表現できないのか」と指摘を受け調査。`buildSeedGraph`（`worker/graph.ts`）・`resolveLineage`（`worker/api/paper.ts`）がいずれも単一 DB のみを対象にしており、祖先（cited 側）が別の年代レンジの DB にいる場合、エッジ行自体は存在してもその祖先の `papers` レコードが見つからず、系譜・グラフから静かに欠落することが判明した。`field17_2021_2025` で実測 1,950 件のエッジが該当（すべて cited 側が別DB、citing 側はなし）。
+- **対応方針**: 全登録 DB を `UNION ALL` する本格対応ではなく、**前後1年代レンジの「隣接DB」だけ追加で検索する最小対応**をユーザーの指示で採用。
+- **実装**: `worker/db.ts` に `listAdjacentDbs()` を追加（`resolveFieldDb()` の戻り値にも実際に解決された `yearRange` を含めるよう拡張）。`worker/graph.ts` の `buildSeedGraph()`・`fetchPapersWithAdjacent()`・`fetchEdgesChunkedWithAdjacent()`、`worker/api/paper.ts` の `resolveLineage()` を隣接DB対応に変更。`worker/api/seed.ts`・`worker/index.ts`（Graph Build Queueのメッセージに `yearRange` を追加）も合わせて変更。
+- **動作確認**: `field17_2021_2025` の論文（id=2991046523, "Multi-Agent Reinforcement Learning..."）が、`field17_2016_2020` にいる2017年の祖先論文を正しく系譜・シードグラフの両方に含むことを `curl` とブラウザ実機の両方で確認した（修正前は祖先が見つからず系譜がそこで打ち切られていた）。
+- **既知の制約**: 2レンジ以上離れた年代をまたぐ系譜（例: 2021-2025 から直接 2011-2015 への祖先）は補完されない。
+
+### 隣接レンジの色分け表示とドロップダウンの年代ソート（2026-11-11）
+
+- **方針**: 上記の隣接DB補完により「隣のレンジの論文も見える」ようになったが、メインレンジと見分けがつかず混乱を招くとの指摘を受け、「あくまでおまけ」であることが一目で分かるよう表示を分けた。あわせて年代ドロップダウンの選択肢順もついでに整理した。
+- **`worker/db.ts`**: `listYearRanges()` に開始年昇順のソートを追加（`DB_REGISTRY` 自体の登録順は既定値を先頭に置く都合でバラバラなため、表示用に明示的にソートする）。
+- **`worker/graph.ts`**: `PaperLookupRowWithSource`（`adjacent: boolean`）型を追加し、`fetchPapersWithAdjacent()` が隣接DB由来かどうかを記録するよう変更。`SeedGraph.nodes` に `a?: boolean` を追加し、`buildSeedGraph()` の最終出力で隣接DB由来のノードにのみ `a: true` を付与する。
+- **`src/types.ts`**: `GraphNode` に `a?: boolean` を追加。
+- **表示方式（当初ノード色分け→レーン背景色分けに修正）**: 最初はノード自体を薄いグレーにする実装にしたが、ユーザーから「ノードじゃなくてレーンの背景色が変わるはず」と指摘を受け、X軸の年単位レーン（`computeYearLanes` が返す背景帯）の方を塗り分ける方式に変更した。ノードの色・濃さは通常のハブ/非ハブ表現のまま変えていない。
+  - **`src/layout.ts`**: `computeYearLanes(minYear, maxYear, mainRange?)` に第3引数を追加し、各 `YearLane` に `isMainRange: boolean` を付与（`mainRange` 省略時は全レーンがメイン扱い）。
+  - **`src/components/GraphView.tsx`**: `GraphViewProps` に `mainYearRange?: {start, end}` を追加。`yearLanes` の各レーンのうち `isMainRange === true` のものに、`var(--lane-bg-main)` の `<rect>` を縞模様の背景に重ねて描画する（隣接レンジ側は変更なしのグレー縞のまま）。ツールチップには "From adjacent range" の文言を残した（`node.a` ベース、隣接ノードであること自体は引き続き `a` フラグで判定）。
+  - **`src/App.tsx`**: `yearRange`（"2016-2020" 形式の文字列）を `{start, end}` にパースする `mainYearRange` を追加し、`GraphView` に渡す。
+  - **配色の調整（2026-11-11 追記）**: 当初は隣接レンジ側にグレーの薄いオーバーレイを足す実装にしたが、「色が微妙すぎる、メインのレーンをもっと明るい背景色（薄い水色）にしてほしい」とのフィードバックを受け、**メインレンジ側に明るい水色のオーバーレイを足す**方式に反転した。`src/App.css` に `--lane-bg-main: rgba(56, 189, 248, 0.14)`（ダークモードは `0.16`）を追加。
+- **`src/components/Header.tsx`**: 凡例を「Adjacent range (faded)」（丸いドット）から「Selected range」（`var(--lane-bg-main)` の矩形サンプル、視認性のため枠線付き）に変更。
+- **動作確認時のハマりどころ（`a` フラグ自体の調査）**: 実装直後に `curl` で確認すると `a` フラグが一切付与されず（`x-data-source: r2-cache`）、一見バグに見えた。原因はコードではなく、**ローカル dev サーバーの R2 エミュレーション（Miniflare、`.wrangler/state/v3/r2/`）に `a` フィールド導入前の古いグラフ JSON がキャッシュされたまま**だったこと（`r2_buckets` には `remote: true` を設定していないため、D1 と違いローカルのダミー R2 を見ている）。`.wrangler/state/v3/r2/` 配下のローカルキャッシュを削除して dev サーバーを再起動したところ `x-data-source: d1-direct` になり、`a` フラグが正しく付与されていることを確認できた。
+- **最終動作確認**: `curl` で id=2991046523 のシードグラフを取得し、2017〜2020年の4ノードに `a: true`、2021年以降の7ノードには `a` フィールドなし（false相当）であることを確認。ブラウザ実機でも同じ論文を検索・選択し、2017〜2020年のレーン背景が薄いグレーの網掛けになり、2021年以降（選択中のメインレンジ）との境目がはっきり見えることを確認した。年代ドロップダウンも `2006-2010, 2011-2015, 2016-2020, 2021-2025, 2026-2030` の昇順で表示されることを確認済み。
+- **未実施**: 本番へのデプロイ（ローカル dev 環境でのみ確認済み）。
+
+### 初期表示の yearRange 不一致の修正（2026-11-11）
+
+- **発覚の経緯**: ユーザー指摘により発覚。初期表示時、`App.tsx` の `yearRange` state が `undefined` のままなので、実際に読み込まれるデータは API 側の既定レンジ（`field17_2021_2025`）なのに、`Header.tsx` のドロップダウンは `yearRange ?? yearRanges[0]` で選択肢の先頭（年代順で最古の `2006-2010`）を表示してしまい、表示中のデータと食い違っていた。また `mainYearRange` も `undefined` のままレーン色分けロジックに渡るため、`isMainRange` が全レーンで `true` 扱いになり、隣接レンジの表示（グレーのまま）もされていなかった。
+- **対応**: フロントが起動時に「yearRange 未指定時に実際に使われる既定レンジ」を知る手段が無かったため、これを `/api/fields` のレスポンスに含めるようにした。
+  - **`worker/db.ts`**: `listDefaultYearRange(field)` を追加（`DB_REGISTRY` のその分野の先頭エントリを返す。`resolveDbEntry` の yearRange 省略時の挙動と同じ基準）。
+  - **`worker/api/fields.ts`**: レスポンスの各 field に `defaultYearRange: string | null` を追加。
+  - **`src/api.ts`**: `FieldInfo` に `defaultYearRange` を追加。
+  - **`src/App.tsx`**: `fetchFields()` 完了時に、`DEFAULT_FIELD` に対応する `defaultYearRange` があれば `setYearRange()` で明示的にセットするよう変更（それまでは `undefined` のまま放置していた）。
+- **動作確認**: `curl "/api/fields"` で `defaultYearRange: "2021-2025"` が返ることを確認。ブラウザ実機で、初期表示時点でドロップダウンが最初から「2021-2025」を選択状態で表示し、かつグラフの2021年以降のレーンが最初から水色（メインレンジ）で描画されることを確認した。
+
+### 選択中論文の著者・キーワード表示（2026-11-11）
+
+- **背景**: `migrations/0004`（authorships）・`0005`（keywords/paper_keywords）は以前からテーブル定義のみ先行で入っていたが、S3 ingest で実データも既に投入済みだった（`field17_2021_2025` で実測 authorships 87,702件・keywords 52,278件・paper_keywords 133,330件）。これまで著者名検索（`worker/api/search.ts`）でしか使っておらず、論文詳細画面には表示していなかったので追加した。
+- **`worker/api/paper.ts`**: `GET /fields/:field/paper/:id` のレスポンスに `authors: string[]`・`keywords: {name, score}[]` を追加。
+  - `fetchAuthors()`: `authorships` を `paper_id` で絞り `ORDER BY rowid` で取得。`rowid` が ingest 時の INSERT 順と一致するため、OpenAlex の元の著者順（筆頭著者が先頭）をそのまま復元できる（著者順を保持する専用カラムは無いため、この前提に依存する）。
+  - `fetchKeywords()`: `paper_keywords JOIN keywords` を `score DESC` で取得。
+- **`src/types.ts`**: `KeywordInfo {name, score}` を追加。`PaperDetail` に `authors`・`keywords` を追加。
+- **`src/App.tsx`**: `selectedAuthors`・`selectedKeywords` state を追加し、`handleSelect`/`handleDeselect` で `fetchPaper()` の結果から設定・クリアする。
+- **`src/components/SidePanel.tsx`**: 「Selected paper」セクションの外部リンクの下に、著者をカンマ区切りの1行、キーワードを `--accent`/`--accent-soft` を使った丸みのあるタグ一覧として表示。どちらも空配列（データ無し）の場合は何も表示しない。
+- **動作確認**: `curl "/api/fields/17/paper/2991046523?yearRange=2021-2025"` で `authors`/`keywords` が正しく返ることを確認。ブラウザ実機でノードを選択し、著者名一覧とキーワードタグが表示されることを確認した（例: "Masked-attention Mask Transformer..." で "Bowen Cheng, Alexander Kirillov, ..." とタグ "semantic segmentation" 等）。
+
+### 検索結果クリック時に選択ノードへジャンプしないバグの修正、およびキーワード検索の追加（2026-11-11）
+
+- **発覚の経緯**: ユーザーから「キーワードで検索して、検索結果の論文をクリックするとグラフのノードにジャンプするはずなのになぜか表示されない。縮小されすぎておかしくなってる可能性がある」と報告。
+- **原因（ジャンプしないバグ）**: `GraphView.tsx` のパン・ズーム自動調整は、キーボードでの親子・兄弟移動（`tentative` 状態）と Enter/Space 確定時にしか発火しておらず、検索結果一覧やトップ論文一覧のクリック（`App.tsx` の `handleSelectFromList`）では一切 transform を調整していなかった。特に、クリックした論文が現在のグラフに無い場合は `fetchSeedGraph()` で全く別のグラフに差し替わるため、直前の transform（別の年代・別のズーム状態）がそのまま残り、新しいノードの座標がその transform では画面外や極端なスケール換算になって「表示されない／縮小されすぎ」に見えていた。
+- **対応**: 一覧からの選択時にパン・ズームを選択ノードへ強制的に合わせ直す専用の仕組みを追加した。
+  - **`src/components/GraphView.tsx`**: `focusRequestId?: number` prop を追加。この値が変化した（呼び出し側がインクリメントした）ときだけ、選択中ノードを中心にスケール1でビューを再センタリングする専用の `useEffect` を追加（既存のキーボード用フィットロジックとは独立）。
+  - **`src/App.tsx`**: `viewFocusRequestId` state を追加し、`handleSelectFromList()` 内（同一グラフ内で見つかった場合・別グラフを読み込み直した場合の両方）でインクリメントして `GraphView` に渡す。
+- **追加対応（キーワード検索）**: ユーザーに確認の上、ついでに「キーワードそのもので検索できない」制約も解消した。`worker/api/search.ts` に `paper_keywords`/`keywords` テーブルに対する `EXISTS` サブクエリを追加し、タイトル・著者名に加えてキーワード名の部分一致でもヒットするようにした（1論文に複数の著者・キーワードがマッチして行が増えるのを避けるため、素朴な LEFT JOIN + DISTINCT ではなく EXISTS 方式を採用）。
+- **動作確認**: `curl` で `q=semantic segmentation` を検索し、タイトルに該当語を含まない論文（"Masked-attention Mask Transformer..."、キーワードタグ経由でのみマッチ）が1位でヒットすることを確認。ブラウザ実機でこの検索結果をクリックし、同一グラフ内のケース・別グラフに切り替わるケースの両方で、選択ノードが画面中央に正しく表示されることを確認した。
+
+### 隣接年代ノード選択時に論文詳細・系譜・著者・キーワードが表示されないバグの修正（2026-11-11）
+
+- **発覚の経緯**: ユーザーから「隣接年代のノードをクリックしたときだけ論文のジャンプ先やキーワードなどの詳細が表示されない」と報告。
+- **原因**: `worker/api/paper.ts` の `GET /fields/:field/paper/:id` が、論文本体（`paper`）の取得だけメインDB（`database`）しか見ていなかった。隣接DB由来のノード（`GraphNode.a === true`、SPEC.md 4.4）はメインDBの `papers` テーブルに存在しないため、常に 404 になり、フロント側（`App.tsx` の `handleSelect`）の `catch` で `lineage`/`selectedPaper`/`authors`/`keywords` が全部空にリセットされていた。`resolveLineage`（祖先探索）自体は元々メインDB・隣接DBの両方を見る実装だったが、起点の `paper` 自体が見つからず早期リターンしていたため実行されていなかった。
+- **対応**: `worker/api/paper.ts` に `resolvePaper()` を追加し、メインDB→隣接DBの順に論文本体を探すよう変更。論文が実際に見つかった DB（`paperDb`）を、以降の `resolveLineage()`・`fetchAuthors()`・`fetchKeywords()` にも使うよう変更した（著者・キーワード・系譜の起点エッジは、論文が実際に属する DB に保存されているため、常にメインDB固定の `database` を使い続けると、隣接DB由来の論文ではこれらも見つからないままになる）。
+- **動作確認**: `curl "/api/fields/17/paper/2736601468?yearRange=2021-2025"`（`field17_2016_2020` にのみ存在する2017年の論文）で、修正前は `{"error": "paper not found"}` だったのが、修正後は `paper`・`authors`・`keywords` が正しく返ることを確認。ブラウザ実機でも、隣接年代（薄い水色レンジ外）のハブノードを選択し、論文詳細・OpenAlex/DOIリンク・著者一覧・キーワードタグが全て表示されることを確認した。
+
+### R2グラフキャッシュの削除エンドポイント追加（2026-11-11）
+
+- **背景**: このセッション中に何度も「グラフ構築ロジックやデータを変更しても、R2にキャッシュ済みの古いグラフ JSON がそのまま返り続ける」問題でバグ調査が混乱した（`X-Data-Source: r2-cache` のまま変化が反映されない）。これまでは `wrangler r2 object delete`（本番）や `.wrangler/state/v3/r2/` 配下の手動削除（ローカル、Miniflare のエミュレーションストレージ）で都度対応していた。ユーザーに確認の上、簡易な削除APIを追加した。
+- **`worker/api/seed.ts`**: `DELETE /api/fields/:field/seed/:id` を追加。`depth`（1〜`SEED_DEPTH_MAX`）ごとにキーが分かれているため、該当する全てのキー（`graph/field{N}/seed-{id}-d{1,2,3}.json`）をまとめて `BUCKET_FIELD17.delete()` で削除し、削除したキー一覧を返す。本番運用での自動無効化（バージョニング等）ではなく、開発時に手動で強制再生成させるための開発用エンドポイントという位置づけ。
+- **動作確認**: `curl -X DELETE "/api/fields/17/seed/2991046523"` で3つの depth 分のキーが削除されること、削除後の `GET` が `X-Data-Source: d1-direct`（D1から再計算）に戻ることを確認した。
+- **未実装のまま**: 本番相当の自動キャッシュ無効化（グラフ生成ロジックのバージョン番号をキーに埋め込む等）は見送り。コード変更時に古いキャッシュが残る問題は、今後もこの DELETE エンドポイントで都度クリアする運用想定。
+- **一斉削除の追加**: 「seed_id をいちいち調べるのが面倒」とのユーザー要望を受け、`DELETE /api/fields/:field/seed`（id 無し）を追加した。`BUCKET_FIELD17.list({prefix: "graph/field{N}/"})` でその分野の全キャッシュキーを列挙し（R2 の list は1回最大1000件なので `cursor` でページングして全件集める）、`delete()` で一括削除する（R2 の delete も1回最大1000件のため1000件ずつに分割）。レスポンスは削除件数のみ（`{deletedCount}`）。`curl -X DELETE "/api/fields/17/seed"` で動作確認し、2つの異なる seed のキャッシュが両方削除され、以降の GET がどちらも `d1-direct` に戻ることを確認した。

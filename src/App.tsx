@@ -7,7 +7,7 @@ import { SidePanel } from "./components/SidePanel";
 import { fetchFields, fetchHubs, fetchPaper, fetchSeedGraph, fetchTop, type FieldInfo } from "./api";
 import { HUB_MIN_CHILD_DEFAULT, resolveLineageIds, resolveLineageSubtree, resolveSkeleton } from "./filters";
 import { SAMPLE_GRAPH } from "./sampleData";
-import type { GraphNode, PaperSummary, SeedGraph } from "./types";
+import type { GraphNode, KeywordInfo, PaperSummary, SeedGraph } from "./types";
 
 const TOP_CITED_SEED_FALLBACK = 2194775991; // Deep Residual Learning（被引用 1 位、2026-11 時点）
 const DEFAULT_FIELD = 17; // 計算機科学（SPEC.md 4.2）
@@ -35,16 +35,31 @@ function App() {
 	const [lineage, setLineage] = useState<PaperSummary[]>([]);
 	// 選択中論文の詳細（doi 等、GraphNode には持たせていない情報。/api/.../paper/{id} から取得）。
 	const [selectedPaper, setSelectedPaper] = useState<PaperSummary | null>(null);
+	// 選択中論文の著者・キーワード（2026-11-11、SPEC.md 4.4。authorships/keywords テーブルから取得）。
+	const [selectedAuthors, setSelectedAuthors] = useState<string[]>([]);
+	const [selectedKeywords, setSelectedKeywords] = useState<KeywordInfo[]>([]);
 	// サイドパネルはデフォルト非表示。論文選択時に自動で開く、または手動トグルで開閉する（表示エリアを広く保つため）。
 	const [panelOpen, setPanelOpen] = useState(false);
+	// 検索結果・top/hubs 一覧からの選択時に、GraphView へ「このノードへパン・ズームを強制的に合わせ直せ」と
+	// 伝えるためのリクエスト番号。選択するたびにインクリメントする（2026-11-11、別グラフに切り替わった後も
+	// 直前の transform が残り、選択ノードが画面外・極端なスケールで見えなくなるバグの修正）。
+	const [viewFocusRequestId, setViewFocusRequestId] = useState(0);
 
 	// 利用可能な分野・年代レンジの一覧を取得する（Header のセレクトボックス用）。失敗しても致命的ではない
 	// （DEFAULT_FIELD・yearRange 未指定のまま動作を続けられる）。
+	// yearRange はここで明示的に defaultYearRange をセットする。未指定（undefined）のままだと、実際に
+	// 読み込まれるデータ（API 側の既定レンジ）とドロップダウンの表示（選択肢の先頭）が食い違うため
+	// （2026-11-11、ユーザー指摘により修正）。
 	useEffect(() => {
 		let cancelled = false;
 		fetchFields()
 			.then((res) => {
-				if (!cancelled) setAvailableFields(res.fields);
+				if (cancelled) return;
+				setAvailableFields(res.fields);
+				const defaultField = res.fields.find((f) => f.field === DEFAULT_FIELD);
+				if (defaultField?.defaultYearRange) {
+					setYearRange(defaultField.defaultYearRange);
+				}
 			})
 			.catch(() => {
 				/* セレクトボックスの選択肢が増えないだけなので致命的ではない */
@@ -148,6 +163,15 @@ function App() {
 		[selectedId, graph],
 	);
 
+	// "2016-2020" 形式の yearRange を GraphView のレーン背景色分け用に {start, end} へパースする
+	// （2026-11-11、SPEC.md 4.4。未選択時は undefined のままで全レーンがメイン扱いになる）。
+	const mainYearRange = useMemo(() => {
+		if (!yearRange) return undefined;
+		const match = /^(\d{4})-(\d{4})$/.exec(yearRange);
+		if (!match) return undefined;
+		return { start: Number(match[1]), end: Number(match[2]) };
+	}, [yearRange]);
+
 	const selectedNode = useMemo(
 		() => (selectedId !== null ? graph.nodes.find((n) => n.id === selectedId) ?? null : null),
 		[selectedId, graph],
@@ -169,12 +193,18 @@ function App() {
 					const detail = await fetchPaper(field, yearRange, id);
 					setLineage(detail.lineage);
 					setSelectedPaper(detail.paper);
+					setSelectedAuthors(detail.authors);
+					setSelectedKeywords(detail.keywords);
 				} catch {
 					setLineage([]);
 					setSelectedPaper(null);
+					setSelectedAuthors([]);
+					setSelectedKeywords([]);
 				}
 			} else {
 				setSelectedPaper(null);
+				setSelectedAuthors([]);
+				setSelectedKeywords([]);
 			}
 		},
 		[isSample, field, yearRange],
@@ -184,6 +214,8 @@ function App() {
 		setSelectedId(null);
 		setLineage([]);
 		setSelectedPaper(null);
+		setSelectedAuthors([]);
+		setSelectedKeywords([]);
 	}, []);
 
 	const handleResetView = useCallback(() => {
@@ -209,11 +241,15 @@ function App() {
 	}, [selectedId]);
 
 	// top/hubs/検索結果は現在のグラフ範囲外の場合がある。その場合はそのシードで新たにグラフを読み込む。
+	// いずれの場合も、選択後に GraphView 側のパン・ズームを選択ノードへ強制的に合わせ直す
+	// （2026-11-11。一覧からの選択はマウスクリックの通常選択と違い、現在の画面外・別の年代レンジだった
+	// 可能性があるため、直前の transform のままだとノードが見えない・極端に縮小されたままになるバグがあった）。
 	const handleSelectFromList = useCallback(
 		async (id: number) => {
 			const node = graph.nodes.find((n) => n.id === id);
 			if (node) {
 				handleSelect(id);
+				setViewFocusRequestId((n) => n + 1);
 				return;
 			}
 			if (isSample) return;
@@ -223,6 +259,7 @@ function App() {
 				setFocusId(null);
 				setCollapsedIds(new Set());
 				await handleSelect(id);
+				setViewFocusRequestId((n) => n + 1);
 			} catch (err) {
 				setLoadError(err instanceof Error ? err.message : String(err));
 			}
@@ -273,12 +310,16 @@ function App() {
 						lineageIds={lineageIds}
 						onSelect={handleSelect}
 						onDeselect={handleDeselect}
+						mainYearRange={mainYearRange}
+						focusRequestId={viewFocusRequestId}
 					/>
 				</main>
 				{panelOpen && (
 					<SidePanel
 						selectedNode={selectedNode}
 						selectedPaper={selectedPaper}
+						selectedAuthors={selectedAuthors}
+						selectedKeywords={selectedKeywords}
 						lineage={lineage}
 						topPapers={topPapers}
 						hubPapers={hubPapers}

@@ -89,10 +89,13 @@ export interface YearLane {
 	year: number;
 	xStart: number;
 	xEnd: number;
+	isMainRange: boolean;
 }
 
 // 年ごとに薄いレーン（背景帯）を描画するための区切りを計算する。
-export function computeYearLanes(minYear: number, maxYear: number): YearLane[] {
+// mainRange が指定されていれば、そのレンジ内の年とレンジ外（隣接 DB 由来、SPEC.md 4.4）の年を
+// isMainRange で区別できるようにする（2026-11-11。レンジ外は「あくまでおまけ」であることを背景色で示す）。
+export function computeYearLanes(minYear: number, maxYear: number, mainRange?: { start: number; end: number }): YearLane[] {
 	const startYear = Math.floor(minYear);
 	const endYear = Math.floor(maxYear);
 	const lanes: YearLane[] = [];
@@ -101,6 +104,7 @@ export function computeYearLanes(minYear: number, maxYear: number): YearLane[] {
 			year,
 			xStart: yearToX(year, minYear),
 			xEnd: yearToX(year + 1, minYear),
+			isMainRange: mainRange ? year >= mainRange.start && year <= mainRange.end : true,
 		});
 	}
 	return lanes;

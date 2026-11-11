@@ -2,11 +2,11 @@ import { Hono } from "hono";
 import { resolveFieldDb, type PaperRow } from "../db.js";
 import { SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX } from "../constants.js";
 
-// GET /api/fields/:field/search — 論文名・著者名の検索（SPEC.md 5章）。
+// GET /api/fields/:field/search — 論文名・著者名・キーワードの検索（SPEC.md 5章）。
 // 検索方式は D1 の LIKE を初期採用（ARCHITECT.md 7-5）。将来的に速度が問題になれば転置インデックス等を検討する。
-// 著者名は authorships テーブル（migrations/0004、1論文に複数行）を LEFT JOIN し、
-// タイトルまたは著者名のどちらかに部分一致すればヒットさせる。1論文に複数の著者がマッチしうるため DISTINCT で重複を除く。
-// authorships テーブルへの実データ投入は S3 からの ingest 実装時に行う想定（それまでは LEFT JOIN 先が常に空でもタイトル検索は従来通り動作する）。
+// 著者名（authorships、migrations/0004）・キーワード（paper_keywords/keywords、migrations/0005）は
+// それぞれ EXISTS サブクエリで判定する（2026-11-11、キーワード対応追加。JOIN だと1論文に複数の著者・
+// キーワードがマッチして行が掛け算で増えるため、素朴な LEFT JOIN + DISTINCT より EXISTS の方が安全）。
 export const searchRoute = new Hono<{ Bindings: Env }>().get("/fields/:field/search", async (c) => {
 	const resolved = resolveFieldDb(c.env, c.req.param("field"), c.req.query("yearRange"));
 	if (!resolved.ok) {
@@ -31,13 +31,20 @@ export const searchRoute = new Hono<{ Bindings: Env }>().get("/fields/:field/sea
 
 	const { results } = await database
 		.prepare(
-			`SELECT DISTINCT p.id, p.field, p.title, p.year, p.cit, p.fwci, p.subfield, p.child_cnt, p.doi
+			`SELECT p.id, p.field, p.title, p.year, p.cit, p.fwci, p.subfield, p.child_cnt, p.doi
 			 FROM papers p
-			 LEFT JOIN authorships a ON a.paper_id = p.id
-			 WHERE p.field = ? AND (p.title LIKE ? ESCAPE '\\' OR a.author_name LIKE ? ESCAPE '\\')
+			 WHERE p.field = ?
+			   AND (
+			     p.title LIKE ? ESCAPE '\\'
+			     OR EXISTS (SELECT 1 FROM authorships a WHERE a.paper_id = p.id AND a.author_name LIKE ? ESCAPE '\\')
+			     OR EXISTS (
+			       SELECT 1 FROM paper_keywords pk JOIN keywords k ON k.id = pk.keyword_id
+			       WHERE pk.paper_id = p.id AND k.name LIKE ? ESCAPE '\\'
+			     )
+			   )
 			 ORDER BY p.cit DESC LIMIT ?`,
 		)
-		.bind(field, pattern, pattern, limit)
+		.bind(field, pattern, pattern, pattern, limit)
 		.all<PaperRow>();
 
 	return c.json({ papers: results });

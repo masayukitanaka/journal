@@ -74,6 +74,13 @@ export function Header({ isSample, availableFields, field, onFieldChange, yearRa
 			<div style={{ display: "flex", alignItems: "center", gap: 12, marginLeft: "auto", fontSize: 12 }}>
 				<Legend color="rgb(220, 38, 38)" label="Hub (many children)" />
 				<Legend color="#9ca3af" label="Non-hub" />
+				<span
+					style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--muted-text)" }}
+					title="The selected year range is highlighted; years outside it are shown plain — those papers are shown only for context"
+				>
+					<span style={{ width: 14, height: 10, background: "var(--lane-bg-main)", border: "1px solid var(--border-color)", display: "inline-block" }} />
+					Selected range
+				</span>
 			</div>
 			{/* SPEC.md 7章「帰属表示」: 利用データの出典（OpenAlex、Semantic Scholar）を画面に表示する。 */}
 			<span style={{ fontSize: 11, color: "var(--muted-text)", width: "100%" }}>

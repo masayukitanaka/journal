@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { GraphNode, PaperSummary } from "../types";
+import type { GraphNode, KeywordInfo, PaperSummary } from "../types";
 import { searchPapers } from "../api";
 import { formatChildCount, formatCitationCount, formatYearMonth } from "../layout";
 import { doiUrl, openAlexPageUrl } from "../links";
@@ -7,6 +7,8 @@ import { doiUrl, openAlexPageUrl } from "../links";
 interface SidePanelProps {
 	selectedNode: GraphNode | null;
 	selectedPaper: PaperSummary | null;
+	selectedAuthors: string[];
+	selectedKeywords: KeywordInfo[];
 	lineage: PaperSummary[];
 	topPapers: PaperSummary[];
 	hubPapers: PaperSummary[];
@@ -25,6 +27,8 @@ interface SidePanelProps {
 export function SidePanel({
 	selectedNode,
 	selectedPaper,
+	selectedAuthors,
+	selectedKeywords,
 	lineage,
 	topPapers,
 	hubPapers,
@@ -69,6 +73,27 @@ export function SidePanel({
 							{formatYearMonth(selectedNode.y)} · {formatCitationCount(selectedNode.c)} · {formatChildCount(selectedNode.k)}
 						</div>
 						<ExternalLinks paper={selectedPaper} />
+						{selectedAuthors.length > 0 && (
+							<div style={{ marginBottom: 8, color: "var(--muted-text)" }}>{selectedAuthors.join(", ")}</div>
+						)}
+						{selectedKeywords.length > 0 && (
+							<div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+								{selectedKeywords.map((k) => (
+									<span
+										key={k.name}
+										style={{
+											fontSize: 11,
+											padding: "2px 8px",
+											borderRadius: 999,
+											background: "var(--accent-soft)",
+											color: "var(--accent)",
+										}}
+									>
+										{k.name}
+									</span>
+								))}
+							</div>
+						)}
 						<div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
 							<button className="btn" onClick={onToggleCollapseDescendants}>
 								{collapsedDescendants ? "Expand children" : "Collapse children"}

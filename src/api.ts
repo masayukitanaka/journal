@@ -5,6 +5,7 @@ export interface FieldInfo {
 	field: number;
 	name: string;
 	yearRanges: string[]; // "2016-2026" 形式
+	defaultYearRange: string | null; // yearRange 未指定時に実際に使われるレンジ
 }
 
 async function getJson<T>(url: string): Promise<T> {

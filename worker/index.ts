@@ -7,7 +7,7 @@ import { paperRoute } from "./api/paper.js";
 import { attributionRoute } from "./api/attribution.js";
 import { fieldsRoute } from "./api/fields.js";
 import { buildSeedGraph, graphKey } from "./graph.js";
-import { resolveDb } from "./db.js";
+import { listAdjacentDbs, resolveDb, type YearRange } from "./db.js";
 
 export { IngestWorkflow } from "./ingest-workflow.js";
 export { RateLimiterOpenAlex, RateLimiterSemanticScholar } from "./rate-limiter.js";
@@ -34,6 +34,7 @@ app.onError((err, c) => {
 
 interface GraphBuildMessage {
 	field: number;
+	yearRange: YearRange;
 	seedId: number;
 	depth: number;
 }
@@ -43,13 +44,14 @@ export default {
 	// Graph Builder（ARCHITECT.md 3.2）。シード周辺グラフを R2 に事前構築する。
 	async queue(batch, env) {
 		for (const message of batch.messages) {
-			const { field, seedId, depth } = message.body;
-			const database = resolveDb(env, field);
+			const { field, yearRange, seedId, depth } = message.body;
+			const database = resolveDb(env, field, yearRange);
 			if (!database) {
 				message.ack();
 				continue;
 			}
-			const graph = await buildSeedGraph(database, seedId, depth, 0);
+			const adjacentDbs = listAdjacentDbs(env, field, yearRange);
+			const graph = await buildSeedGraph(database, seedId, depth, 0, adjacentDbs);
 			if (graph) {
 				await env.BUCKET_FIELD17.put(graphKey(field, seedId, depth), JSON.stringify(graph));
 			}

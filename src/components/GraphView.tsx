@@ -13,6 +13,14 @@ interface GraphViewProps {
 	lineageIds: Set<number>;
 	onSelect: (id: number) => void;
 	onDeselect: () => void;
+	// 現在選択中の年代レンジ（"2016-2020" 形式）。レーン背景色をメイン/隣接で塗り分けるために使う
+	// （2026-11-11、SPEC.md 4.4）。未指定時は全レーンをメイン扱いにする。
+	mainYearRange?: { start: number; end: number };
+	// 検索結果・top/hubs 一覧からの選択時に、選択ノードへ強制的にパン・ズームをリセットさせるための
+	// リクエスト番号（呼び出し側が選択のたびにインクリメントする）。マウス操作では自動フィットしない
+	// 既存の挙動と区別するため、この値が変わったときだけ発火する（2026-11-11、別グラフへの切り替え後に
+	// 直前の transform が残り、新しいノードが画面外・極端なスケールになって見えなくなるバグの修正）。
+	focusRequestId?: number;
 }
 
 interface Transform {
@@ -36,7 +44,7 @@ function bezierPath(x1: number, y1: number, x2: number, y2: number): string {
 	return `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`;
 }
 
-export function GraphView({ nodes, edges, allNodesById, allEdges, selectedId, lineageIds, onSelect, onDeselect }: GraphViewProps) {
+export function GraphView({ nodes, edges, allNodesById, allEdges, selectedId, lineageIds, onSelect, onDeselect, mainYearRange, focusRequestId }: GraphViewProps) {
 	const svgRef = useRef<SVGSVGElement>(null);
 	const [transform, setTransform] = useState<Transform>({ x: 0, y: 0, scale: 1 });
 	const [hoveredId, setHoveredId] = useState<number | null>(null);
@@ -116,6 +124,31 @@ export function GraphView({ nodes, edges, allNodesById, allEdges, selectedId, li
 			}));
 		}
 	}, [tentative, selectedId, nodeById]);
+
+	// 検索結果・top/hubs 一覧からの選択（focusRequestId が変わったとき）は、直前のグラフの transform
+	// （別の年代レンジ・別のズーム状態だったかもしれない）を引きずらないよう、スケールを 1 にリセットして
+	// 選択ノードを画面中心に強制的に合わせる。別グラフへの切り替え直後は新しいノード座標が旧 transform の
+	// 範囲外・極端なスケール換算で画面外に出てしまうため（2026-11-11 バグ修正）。
+	const prevFocusRequestId = useRef(focusRequestId);
+	useEffect(() => {
+		if (focusRequestId === undefined || focusRequestId === prevFocusRequestId.current) return;
+		prevFocusRequestId.current = focusRequestId;
+
+		const svg = svgRef.current;
+		if (!svg) return;
+		const rect = svg.getBoundingClientRect();
+		if (rect.width === 0 || rect.height === 0) return;
+
+		const targetNode = selectedId !== null ? nodeById.get(selectedId) : undefined;
+		if (!targetNode) return;
+
+		const scale = 1;
+		setTransform({
+			scale,
+			x: rect.width / 2 - targetNode.x * scale,
+			y: rect.height / 2 - targetNode.yPos * scale,
+		});
+	}, [focusRequestId, selectedId, nodeById]);
 
 	useEffect(() => {
 		// 候補の中に preferId（直前にいたノード）があればそれを優先し、無ければ「一番上」に相当するものを選ぶ。
@@ -211,8 +244,8 @@ export function GraphView({ nodes, edges, allNodesById, allEdges, selectedId, li
 		return () => window.removeEventListener("keydown", handleKeyDown);
 	}, [selectedId, tentative, allEdges, allNodesById, onSelect]);
 	const yearLanes = useMemo(
-		() => computeYearLanes(layout.minYear, layout.maxYear),
-		[layout.minYear, layout.maxYear],
+		() => computeYearLanes(layout.minYear, layout.maxYear, mainYearRange),
+		[layout.minYear, layout.maxYear, mainYearRange],
 	);
 	const monthGridLines = useMemo(
 		() => computeMonthGridLines(layout.minYear, layout.maxYear),
@@ -290,6 +323,17 @@ export function GraphView({ nodes, edges, allNodesById, allEdges, selectedId, li
 								height={laneHeight}
 								fill={i % 2 === 0 ? "var(--lane-bg-even)" : "var(--lane-bg-odd)"}
 							/>
+							{/* 選択中の年代レンジ（メイン）には明るい水色のオーバーレイを重ね、隣接 DB から補完された
+							  「おまけ」の年（レンジ外）と視覚的にはっきり区別できるようにする（2026-11-11、SPEC.md 4.4）。 */}
+							{lane.isMainRange && (
+								<rect
+									x={lane.xStart}
+									y={0}
+									width={lane.xEnd - lane.xStart}
+									height={laneHeight}
+									fill="var(--lane-bg-main)"
+								/>
+							)}
 							<text
 								x={lane.xStart + 6}
 								y={16}
@@ -333,6 +377,8 @@ export function GraphView({ nodes, edges, allNodesById, allEdges, selectedId, li
 						const dimmed = selectedId !== null && !lineageIds.has(node.id);
 						const isSelected = node.id === selectedId;
 						const isTentative = node.id === tentative?.nodeId;
+						// 隣接する年代レンジかどうかはレーン背景色で表現するため、ノード自体の色・濃さは
+						// 通常のハブ/非ハブ表現のまま変えない（2026-11-11）。
 						return (
 							<circle
 								key={node.id}
@@ -375,6 +421,7 @@ export function GraphView({ nodes, edges, allNodesById, allEdges, selectedId, li
 					<div>
 						{formatYearMonth(hoveredNode.y)} · {formatCitationCount(hoveredNode.c)} · {formatChildCount(hoveredNode.k)}
 						{isHub(hoveredNode) ? " · Hub" : ""}
+						{hoveredNode.a ? " · From adjacent range" : ""}
 					</div>
 				</div>
 			)}

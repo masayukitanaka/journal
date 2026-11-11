@@ -162,6 +162,7 @@ CREATE INDEX idx_paper_keywords_keyword ON paper_keywords(keyword_id);
   - 結合後に祖先が別の分野 DB にあっても、`edges` と `papers` を両方結合すれば辿れる。
   - 祖先の論文情報が自分の分野 DB に無い場合は、祖先の行を `papers` に複製する（`field` は祖先の分野の値を入れる）。
 - `child_cnt` は分野内の数を保存する。分野をまたいだ分岐数は、結合後に再計算する。
+- **実装状況（2026-11-11）**: 年代レンジで分割した DB 間でも同じ結合ルールが当てはまる（SPEC上「分野」と書いている箇所は「分野・年代レンジ」と読み替える）。全 DB を `UNION ALL` で結合する本格対応は未実装。代わりに、前後1年代レンジの「隣接 DB」だけを追加で検索する最小対応を `worker/db.ts` の `listAdjacentDbs()` で実装済み（ARCHITECT.md 3.4.0 参照）。2レンジ以上離れた年代をまたぐ系譜は未対応。
 
 ### 4.5 R2 のグラフ JSON（案）
 
