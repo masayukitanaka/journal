@@ -2,7 +2,7 @@
 
 - ステータス: ドラフト（PoC フェーズ）
 - 対象分野: 計算機科学（OpenAlex Field ID 17）
-- 最終更新: 2026-11-09
+- 最終更新: 2026-11-11
 
 ---
 
@@ -94,9 +94,11 @@
 - 分野 DB は分野ごとに分けるが、スキーマは共通で `papers.field` 列を持つ（4.4 の結合ルール参照）。
 
 ### 4.3 PoC の取り込み範囲（案）
-- 分野 17、発表年 **直近 10 年**（2016〜2026）。
-- 各論文の被引用数の上位 N 件とその引用エッジ（N は DB 容量を見て決める）。
-- 取り込み対象外の論文は、祖先としてのみ必要な場合に限り追加する。
+- 分野 17、発表年 **2006 年以降（約 20 年、2006〜2026）**（2026-11-11 変更。当初は直近 10 年 = 2016〜2026）。
+- 範囲内の**全件**とその引用エッジを取り込む。初期データは OpenAlex S3 スナップショットから一括抽出する（[docs/init-ingest.md](./init-ingest.md)。当初案の「被引用数の上位 N 件」は API 取得時の制約によるもので、S3 方式への切り替えで撤廃）。
+- D1 は**分野 × 5 年単位**で分割する: `field17_2006_2010` / `field17_2011_2015` / `field17_2016_2020` / `field17_2021_2025` / `field17_2026_2030`（ARCHITECT.md 3.4.2）。論文の所属 DB は出版年で決める。
+- 引用エッジは両端（cited・citing）とも取り込み範囲内の論文であるものだけを保存し、引用する側（citing）の DB に置く（4.4 の結合ルール）。cited が別の年代 DB にあるエッジを含む。
+- 取り込み対象外の論文（2005 年以前・分野外）は祖先として追加しない（PoC の簡略化）。
 
 ### 4.4 D1 スキーマ（案）
 
@@ -134,7 +136,7 @@ CREATE INDEX idx_authorships_paper ON authorships(paper_id);
 CREATE INDEX idx_authorships_name  ON authorships(author_name);
 
 -- キーワード（OpenAlex `keywords`: STRUCT(id, display_name, score)[] を辞書化。マイグレーション 0005、2026-11-10）
--- OpenAlex の語彙は分野をまたいで有限（約数万語）なため、辞書テーブルは分野 DB をまたいで重複しても小さい。
+-- 各 DB にはその DB の paper_keywords が参照する語だけを入れる（語彙は当初見積もりの数万語より大きく、2026-11-11 のサンプルで 3 ファイル 8.3 万語）。
 CREATE TABLE keywords (
   id   TEXT PRIMARY KEY,  -- OpenAlex の keyword スラッグ（例: "mysql"）
   name TEXT NOT NULL      -- OpenAlex の display_name（例: "MySQL"）
@@ -152,7 +154,8 @@ CREATE INDEX idx_paper_keywords_keyword ON paper_keywords(keyword_id);
 
 - 分岐数は `child_cnt` として事前計算する（集計クエリを毎回走らせない）。
 - ID は数値に変換して容量を抑える。
-- 1 データベースの上限は 10 GB。分野 DB は必要に応じて、年代・サブ分野で分割する。
+- 1 データベースの上限は 10 GB。分野 DB は 5 年単位の年代で分割する（4.3、ARCHITECT.md 3.4.2）。
+- `child_cnt` は DB をまたぐ子（後の年代 DB にある citing）も含めて数える（初期インポート時に全年代のエッジから計算。2026-11-11）。
 
 #### 分野 DB の結合ルール（後で一緒に扱うため）
 - すべての分野 DB は**同一スキーマ**とし、`papers.field` 列を必ず持たせる。
@@ -187,7 +190,7 @@ CREATE INDEX idx_paper_keywords_keyword ON paper_keywords(keyword_id);
 
 すべて `GET`、JSON 応答。`:field` は分野 ID（計算機科学は 17）。分野・年代ごとに D1 を分割する方針
 （4.4「分野 DB の結合ルール」、ARCHITECT.md 3.4.2）に対応し、`:field` パスパラメータと `yearRange`
-クエリパラメータ（`"2016-2026"` 形式、省略時はその分野の既定レンジ）でどの DB を見るか指定する
+クエリパラメータ（`"2016-2020"` 形式、省略時はその分野の既定レンジ）でどの DB を見るか指定する
 （`worker/db.ts` の `DB_REGISTRY` が実際に登録済みの組み合わせの正とする。2026-11-10 追加）。
 
 | パス | 説明 | 主なパラメータ |
@@ -306,7 +309,7 @@ CREATE INDEX idx_paper_keywords_keyword ON paper_keywords(keyword_id);
 | フェーズ | 内容 | 完了条件 |
 |---|---|---|
 | P0 | 仕様確定、OpenAlex の API キー取得、フィルタ名の確認 | 本仕様の未確定事項が解消 |
-| P1 | 分野 17・直近 10 年の抽出スクリプト（オフライン） | 件数・分岐数が検証できる |
+| P1 | 分野 17・2006 年以降の抽出スクリプト（オフライン、S3 スナップショット） | 件数・分岐数が検証できる |
 | P2 | D1 投入、API（top / hubs / seed） | 検証項目のうち API 関連が通る |
 | P3 | フロントエンドを実データに接続 | 検証項目のうち表示関連が通る |
 | P4 | キャッシュ（R2 / Cache API）と外部 API 連携 | 検索・シード探索が実用速度 |

@@ -51,6 +51,39 @@
 			"database_name": "field17_2016_2026",
 			"database_id": "256986fe-4e3a-45c4-801d-bd613dab19e6",
 			"remote": true
+		},
+		// 5 年単位の年代 DB（SPEC.md 4.3、ARCHITECT.md 3.4.2、2026-11-11 作成）。
+		// S3 スナップショットからの初期インポート（docs/init-ingest.md、scripts/ingest/）の投入先。
+		// 動作確認後、上の field17_2016_2026（旧方針の仮 DB）を廃止する予定。
+		{
+			"binding": "DB_FIELD17_2006_2010",
+			"database_name": "field17_2006_2010",
+			"database_id": "674c579d-23d3-43c3-985e-61ec1d6bf7b5",
+			"remote": true
+		},
+		{
+			"binding": "DB_FIELD17_2011_2015",
+			"database_name": "field17_2011_2015",
+			"database_id": "964d0981-ad71-41ad-bb02-88c81993fc3e",
+			"remote": true
+		},
+		{
+			"binding": "DB_FIELD17_2016_2020",
+			"database_name": "field17_2016_2020",
+			"database_id": "fc881b17-24af-4eee-90e7-ec6d91f59eba",
+			"remote": true
+		},
+		{
+			"binding": "DB_FIELD17_2021_2025",
+			"database_name": "field17_2021_2025",
+			"database_id": "2dcce76f-dc22-49bc-9731-d65fc6826b02",
+			"remote": true
+		},
+		{
+			"binding": "DB_FIELD17_2026_2030",
+			"database_name": "field17_2026_2030",
+			"database_id": "c1e37da2-dd71-4ae6-b9e7-b722d29ba58d",
+			"remote": true
 		}
 	],
 	/**

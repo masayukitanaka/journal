@@ -33,7 +33,14 @@ interface DbRegistryEntry {
 
 // 分野・年代レンジ → D1 binding 名の対応表。新しい DB を追加したらここに 1 行足す。
 const DB_REGISTRY: DbRegistryEntry[] = [
+	// 先頭が既定（yearRange 省略時）。旧方針の仮 DB。5 年単位 DB へのデータ投入・動作確認後に廃止する。
 	{ field: 17, yearRange: { start: 2016, end: 2026 }, binding: "DB_FIELD17_2016_2026" },
+	// 5 年単位の年代 DB（SPEC.md 4.3、ARCHITECT.md 3.4.2、2026-11-11 追加）
+	{ field: 17, yearRange: { start: 2006, end: 2010 }, binding: "DB_FIELD17_2006_2010" },
+	{ field: 17, yearRange: { start: 2011, end: 2015 }, binding: "DB_FIELD17_2011_2015" },
+	{ field: 17, yearRange: { start: 2016, end: 2020 }, binding: "DB_FIELD17_2016_2020" },
+	{ field: 17, yearRange: { start: 2021, end: 2025 }, binding: "DB_FIELD17_2021_2025" },
+	{ field: 17, yearRange: { start: 2026, end: 2030 }, binding: "DB_FIELD17_2026_2030" },
 ];
 
 export function listFields(): number[] {

@@ -32,3 +32,6 @@ dist-ssr
 !.env.example
 
 *.parquet
+
+# OpenAlex 初期インポートの作業領域（scripts/ingest）
+data/openalex/work/
