@@ -444,3 +444,20 @@
 - **`src/App.tsx`**: `isLoadingGraph` state を追加。`field`/`yearRange` 変更時の `useEffect`（top/hubs/シードグラフを再取得する箇所）の先頭で `true` にし、`finally` で必ず `false` に戻す。グラフ表示エリア（`<main>`、`position: relative` を追加）に、`isLoadingGraph` のときだけ `position: absolute; inset: 0` のオーバーレイ（スピナー + "Loading..." テキスト、背景は `var(--graph-bg)` を半透明に）を重ねる。
 - **`src/App.css`**: `@keyframes spin` と `.loading-spinner`（ボーダーの一部を `var(--accent)` にした回転リングスピナー、CSSのみでJSライブラリ不要）を追加。
 - **動作確認**: ローカル環境は読み込みが速くスピナーが一瞬で消えてしまうため、ブラウザの `window.fetch` を一時的にパッチして `/api/fields/` 宛のリクエストを3秒遅延させた状態で年代を切り替え、スピナーと「Loading...」が画面中央に表示されること、読み込み完了後は消えて新しいグラフに正しく切り替わることを確認した（確認用のパッチは確認後に元に戻した）。
+
+
+### 出版年の誤り（OpenAlex データ品質問題）の調査・修正（2026-11-11）
+
+- **発覚の経緯**: ユーザーから「超有名な論文『Attention is all you need』が見つからない」と報告（実際には存在したが、出版年が誤って2025年扱いになっており、本来の2017年あたりで探すと見つからなかった）。
+- **原因調査**: 該当論文（OpenAlex Work ID 2626778328）を `field17_2021_2025` DB で確認したところ `year=2025.58, cit=24487` だったが、現在の OpenAlex API では `publication_year: 2017, cited_by_count: 136165`（かつ `updated_date` がごく最近）。OpenAlex 側のデータ品質問題（S3 スナップショット取得時点でこの論文のレコードが一時的に誤った出版年になっており、その後 OpenAlex 側で修正された）と判明。他の著名な古典論文（GAN、Batch Normalization、Bitcoin論文、Adam optimizer、VAE、GraphSAGE 等）でも同様の誤りを実測で複数確認し、単発ではなく体系的な問題と判明した。
+- **方針（ユーザーとの合意）**: 全件（約1,144万件）を OpenAlex API で再検証するのは非現実的なため、「出版年の誤りは被引用数が突出して多い著名な古典論文に偏る」という実測に基づき、各 DB で `cit >= 1000`（全 DB 合計 5,011 件）だけを検証対象に絞った。DB 間の移動は papers だけでなく edges（citing側）・authorships・paper_keywords・keywords も完全に移す方式を採用（PoC の年代分割方針との整合を優先）。
+- **`scripts/ingest/fix_misyeared_papers.py`** を新規作成:
+  - 各 DB から `cit >= min_cit`（既定1000）の papers を取得し、OpenAlex API に50件ずつバッチ問い合わせ（`filter=openalex_id:W1|W2|...`）して `publication_year`/`publication_date`/`cited_by_count` を比較する。
+  - 正しい年代バケットが現在の DB と異なる場合のみ、papers・edges(citing側)・authorships・paper_keywords・参照される keywords を移動元 DB から SELECT し、移動先 DB へ INSERT（year・cit を最新値に更新）、移動元 DB から DELETE する。
+  - **重要なバグとその修正（OpenAlex の Work ID マージ）**: 初回実行時、バッチ filter クエリで大量の「見つからない」が発生した。原因は OpenAlex が重複 Work を統合（マージ）した際、古い ID で検索するとレスポンスの `id` が新しい ID になり、バッチ filter のレスポンスからは「どの検索語にヒットしたか」が分からず対応付けが失敗していたため。対策として、バッチで見つからない ID は `/works/W{id}` への個別アクセス（マージ後の新 ID へ自動リダイレクトされる）でフォールバック確認する `fetch_openalex_single()` を追加した。
+  - D1 の SQL 文長上限を避けるため、1件分の INSERT/DELETE 文を80KB程度のチャンクに分割して送る `wrangler_exec_chunked()` を実装（著名論文は edges が多数になりうるため）。
+  - 進捗は `data/openalex/work/fix_misyeared_progress.json` に記録し、再実行時はチェック済み ID をスキップできる。
+- **実行結果（本番 D1、2026-11-11）**: 検証 5,011 件中、21 件が実際に別の年代 DB へ移動された（うち "Attention Is All You Need" は OpenAlex 上で2つの Work ID（2626778328 と、別途マージされた 4385245566）として重複登録されており、両方とも `field17_2021_2025` → `field17_2016_2020` へ正しく移動・`cit` も136,165に更新した）。他の修正例: NetVLAD、FCN（Fully Convolutional Networks）、SHAP、GCN（Kipf & Welling）、PGD Adversarial Training、GraphSAGE、VAE（Auto-Encoding Variational Bayes）、Layer Normalization、Adam optimizer 等、いずれも著名な古典論文。
+- **安全策**: 正しい年代バケットが `DB_REGISTRY`（`field17_2006_2010`〜`field17_2026_2030`）の範囲外（例: 1993年、2005年、1996年など）になるケースも複数検出されたが、未登録の DB への移動は行わずスキップする設計にしてあるため、該当論文はそのまま元の DB に残っている（既知の制約。範囲外年代の DB は本 PoC では作成していない）。
+- **R2 キャッシュのクリア**: 移動した22論文（ID変更含む）をシードとする R2 グラフキャッシュを個別に削除した。それ以外の論文（移動した論文を祖先・子孫として含むグラフ）のキャッシュは、次回そのシードにアクセスされた際に最新の D1 から再計算されるまで、古い値を保持したままになる制約が残る（根本的な自動無効化の仕組みは未実装、既存の DELETE エンドポイント参照）。
+- **未解決の関連事象**: OpenAlex が Work をマージした場合、D1 側のタイトルは移動前の古いタイトルのまま保持される（例: ID 4385245566 は実体が "Attention Is All You Need" にマージされているが、D1 上のタイトルは "Exploiting Generative AI to Scale up Intelligent Tutoring Systems" のまま）。今回のタスク（年の修正）の範囲外として対応していない。
