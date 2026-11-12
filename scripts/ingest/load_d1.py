@@ -121,34 +121,48 @@ def load_db(args, db: str, sql_root: str) -> None:
 
 
 def verify(args, db: str, out_dir: str) -> bool:
+    # 全件を 1 本のクエリで数えると D1 の CPU 時間上限（code 7429）を超えるため、
+    # 件数・合計はテーブルごと、参照整合性は論文 id の範囲ごと（インデックスで範囲を絞る）に分けて問い合わせる
     con = duckdb.connect()
     p = lambda t: f"read_parquet('{os.path.join(out_dir, t + '.parquet')}')"
     expect = {t: con.execute(f"SELECT count(*) FROM {p(t)}").fetchone()[0] for t in TABLES}
     expect["child_cnt_sum"] = con.execute(f"SELECT coalesce(sum(child_cnt), 0) FROM {p('papers')}").fetchone()[0]
     expect["cit_sum"] = con.execute(f"SELECT coalesce(sum(cit), 0) FROM {p('papers')}").fetchone()[0]
+    # 論文 id を --verify-chunk 件ずつに区切る境界。両端は無限に広げ、範囲外の孤立行も数える
+    bounds = [r[0] for r in con.execute(
+        f"SELECT id FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM {p('papers')}) "
+        f"WHERE rn % {args.verify_chunk} = 1 ORDER BY id").fetchall()]
+    ranges = list(zip([-(2 ** 62)] + bounds[1:], [b - 1 for b in bounds[1:]] + [2 ** 62]))
 
-    row = query(args, db, " , ".join([
-        "SELECT (SELECT count(*) FROM papers) AS papers",
-        "(SELECT count(*) FROM edges) AS edges",
-        "(SELECT count(*) FROM authorships) AS authorships",
-        "(SELECT count(*) FROM keywords) AS keywords",
-        "(SELECT count(*) FROM paper_keywords) AS paper_keywords",
-        "(SELECT coalesce(sum(child_cnt), 0) FROM papers) AS child_cnt_sum",
-        "(SELECT coalesce(sum(cit), 0) FROM papers) AS cit_sum",
-        "(SELECT count(*) FROM edges e WHERE NOT EXISTS (SELECT 1 FROM papers p WHERE p.id = e.citing)) AS edges_citing_missing",
-        "(SELECT count(*) FROM authorships a WHERE NOT EXISTS (SELECT 1 FROM papers p WHERE p.id = a.paper_id)) AS authorships_orphan",
-        "(SELECT count(*) FROM paper_keywords k WHERE NOT EXISTS (SELECT 1 FROM papers p WHERE p.id = k.paper_id)) AS pk_paper_orphan",
-        "(SELECT count(*) FROM paper_keywords k WHERE NOT EXISTS (SELECT 1 FROM keywords w WHERE w.id = k.keyword_id)) AS pk_keyword_orphan",
-    ]))[0]
+    got = {t: query(args, db, f"SELECT count(*) AS n FROM {t}")[0]["n"] for t in TABLES}
+    got.update(query(args, db, "SELECT coalesce(sum(child_cnt), 0) AS child_cnt_sum, "
+                               "coalesce(sum(cit), 0) AS cit_sum FROM papers")[0])
+
+    orphan_sql = {
+        "edges_citing_missing": "SELECT count(*) AS n FROM edges e WHERE e.citing BETWEEN {a} AND {b} "
+                                "AND NOT EXISTS (SELECT 1 FROM papers p WHERE p.id = e.citing)",
+        "authorships_orphan": "SELECT count(*) AS n FROM authorships a WHERE a.paper_id BETWEEN {a} AND {b} "
+                              "AND NOT EXISTS (SELECT 1 FROM papers p WHERE p.id = a.paper_id)",
+        "pk_paper_orphan": "SELECT count(*) AS n FROM paper_keywords k WHERE k.paper_id BETWEEN {a} AND {b} "
+                           "AND NOT EXISTS (SELECT 1 FROM papers p WHERE p.id = k.paper_id)",
+        "pk_keyword_orphan": "SELECT count(*) AS n FROM paper_keywords k WHERE k.paper_id BETWEEN {a} AND {b} "
+                             "AND NOT EXISTS (SELECT 1 FROM keywords w WHERE w.id = k.keyword_id)",
+    }
+    orphans = {k: 0 for k in orphan_sql}
+    for i, (a, b) in enumerate(ranges, 1):
+        for k, sql in orphan_sql.items():
+            orphans[k] += query(args, db, sql.format(a=a, b=b))[0]["n"]
+        print(f"  参照整合性 {i}/{len(ranges)} 範囲 済", flush=True)
+
     ok = True
     for k, v in expect.items():
-        mark = "OK" if row[k] == v else "NG"
-        ok &= row[k] == v
-        print(f"  {k}: D1={row[k]:,} 期待={v:,} {mark}")
-    for k in ["edges_citing_missing", "authorships_orphan", "pk_paper_orphan", "pk_keyword_orphan"]:
-        mark = "OK" if row[k] == 0 else "NG"
-        ok &= row[k] == 0
-        print(f"  {k}: {row[k]:,} {mark}")
+        mark = "OK" if got[k] == v else "NG"
+        ok &= got[k] == v
+        print(f"  {k}: D1={got[k]:,} 期待={v:,} {mark}")
+    for k, v in orphans.items():
+        mark = "OK" if v == 0 else "NG"
+        ok &= v == 0
+        print(f"  {k}: {v:,} {mark}")
     return ok
 
 
@@ -163,6 +177,7 @@ def main() -> None:
     ap.add_argument("--allow-nonempty", action="store_true")
     ap.add_argument("--verify-only", action="store_true")
     ap.add_argument("--retries", type=int, default=4, help="wrangler 1 回あたりの試行回数")
+    ap.add_argument("--verify-chunk", type=int, default=20000, help="参照整合性チェックで 1 クエリが扱う論文数")
     ap.add_argument("--reset-progress", action="store_true", help="進捗記録を消して最初から投入する")
     args = ap.parse_args()
 
