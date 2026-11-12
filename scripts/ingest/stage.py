@@ -61,7 +61,10 @@ def q(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 
-def stage_sql(url: str, out_tmp: str, field: int, min_year: int, max_year: int) -> str:
+def stage_sql(url: str, out_tmp: str, field: int, min_year: int, max_year: int, include_xpac: bool) -> str:
+    # is_xpac（2025 年以降の拡張収録分: データセット・ソフトウェア・学位論文等。被引用・参考文献がほぼ無い）は
+    # OpenAlex API が既定で除外するため、API の件数（P0-1）・日次差分（API 経由）と揃えて既定で除外する。
+    xpac = "" if include_xpac else "AND NOT coalesce(is_xpac, false)"
     # 月が欠損している場合は worker/ingest-workflow.ts の yearWithMonth と同じく id から決定的に割り当てる。
     return f"""
     COPY (
@@ -74,6 +77,7 @@ def stage_sql(url: str, out_tmp: str, field: int, min_year: int, max_year: int) 
             FROM read_parquet({q(url)})
             WHERE publication_year BETWEEN {min_year} AND {max_year}
               AND primary_topic.field.id = 'https://openalex.org/fields/{field}'
+              {xpac}
         )
         SELECT
             id,
@@ -116,7 +120,7 @@ def stage_one(url: str, out_dir: str, args) -> tuple[str, int, float]:
     for attempt in range(1, args.retries + 1):
         try:
             con = connection(args.threads, args.memory_limit)
-            con.execute(stage_sql(url, tmp, args.field, args.min_year, args.max_year))
+            con.execute(stage_sql(url, tmp, args.field, args.min_year, args.max_year, args.include_xpac))
             n = con.execute(f"SELECT count(*) FROM read_parquet({q(tmp)})").fetchone()[0]
             os.replace(tmp, out)
             return url, n, time.time() - t0
@@ -142,6 +146,7 @@ def main() -> None:
     ap.add_argument("--memory-limit", default="1GB",
                     help="DuckDB 接続 1 つあたりのメモリ上限（合計はおよそ --jobs 倍。7.6 GB の EC2 で 4 並列なら 1GB）")
     ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--include-xpac", action="store_true", help="is_xpac=true の論文も含める（既定は API と同じく除外）")
     args = ap.parse_args()
 
     manifest = json.load(open(args.manifest))
@@ -156,7 +161,8 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
     # 条件の違う中間ファイルが混ざらないよう、既存の stage と条件が違う場合は止める
     params = {"snapshot_date": manifest.get("date"), "field": args.field,
-              "min_year": args.min_year, "max_year": args.max_year}
+              "min_year": args.min_year, "max_year": args.max_year,
+              "include_xpac": args.include_xpac}
     params_path = os.path.join(args.work, "stage_params.json")
     if os.path.exists(params_path) and os.listdir(out_dir):
         prev = json.load(open(params_path))

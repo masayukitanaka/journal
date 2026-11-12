@@ -7,7 +7,7 @@ DB の区切り: anchor 年（既定 2011）から bucket 年（既定 5）ご�
   論文の所属 DB は publication_year（= floor(year)）で決める。DB 名は field{分野}_{開始年}_{終了年}。
 
 処理:
-  1. 同じ id が複数ファイルに現れた場合は updated_date が最新の行を採用する
+  1. 同じ id が複数ファイルに現れた場合は updated_date が最新の行を採用する（id だけで集計して判定）
   2. papers         : id, field, title, year, cit, fwci, subfield, child_cnt, doi（論文の年代の DB）
   3. edges          : cited = 引用された側（祖先）, citing = 引用した側（子孫）。
                       cited が「取り込んだ全年代の papers」のどこかに存在するものだけ残し、
@@ -73,25 +73,33 @@ def main() -> None:
         print(f"{label}: {time.time() - t:.1f}s", flush=True)
 
     a, w = args.bucket_anchor, args.bucket_years
-    step("raw（重複 id は最新 updated_date を採用、年代 bucket 付与）", f"""
-        CREATE TABLE raw AS
-        SELECT * EXCLUDE (rn),
-               ({a} + {w} * floor((floor(year) - {a}) / {w}))::INTEGER AS bucket
-        FROM (
-            SELECT *, row_number() OVER (PARTITION BY id ORDER BY updated_date DESC) AS rn
-            FROM read_parquet({q(stage_glob)})
-        ) WHERE rn = 1
+    # 重複 id は id だけで集計して確認する（全列にウィンドウ関数をかけると 7.6 GB のマシンで OOM になったため）。
+    # 同じ id が複数ファイルにあれば updated_date が最新の行を採用する（2026-10-14 スナップショットでは重複 0 件）。
+    step("dup（重複 id の確認）", f"""
+        CREATE TABLE dup AS
+        SELECT id, max(updated_date) AS ud FROM read_parquet({q(stage_glob)}, filename = false)
+        GROUP BY id HAVING count(*) > 1
     """)
-    n_stage, n_dup = con.execute(f"""
-        SELECT count(*), count(*) - count(DISTINCT id) FROM read_parquet({q(stage_glob)})
-    """).fetchone()
+    n_stage = con.execute(f"SELECT count(*) FROM read_parquet({q(stage_glob)})").fetchone()[0]
+    n_dup = con.execute("SELECT count(*) FROM dup").fetchone()[0]
+    step("raw（年代 bucket 付与）", f"""
+        CREATE TABLE raw AS
+        SELECT s.*, ({a} + {w} * floor((floor(s.year) - {a}) / {w}))::INTEGER AS bucket
+        FROM read_parquet({q(stage_glob)}) s
+        LEFT JOIN dup d ON d.id = s.id
+        WHERE d.id IS NULL OR s.updated_date = d.ud
+    """)
+    if n_dup:
+        # 同じ id・同じ updated_date の行が残った場合は 1 行に絞る
+        con.execute("DELETE FROM raw WHERE id IN (SELECT id FROM dup) AND rowid NOT IN "
+                    "(SELECT min(rowid) FROM raw WHERE id IN (SELECT id FROM dup) GROUP BY id)")
     step("ids", "CREATE TABLE ids AS SELECT id, bucket FROM raw")
 
     # edges は citing 側の bucket に置く。cited は全年代のどこかに存在すればよい
     step("edges", """
         CREATE TABLE edges AS
-        SELECT DISTINCT e.cited, e.citing, e.bucket
-        FROM (SELECT unnest(refs) AS cited, id AS citing, bucket FROM raw) e
+        SELECT e.cited, e.citing, e.bucket
+        FROM (SELECT unnest(list_distinct(refs)) AS cited, id AS citing, bucket FROM raw) e
         SEMI JOIN ids p ON p.id = e.cited
         WHERE e.cited <> e.citing
     """)
@@ -107,7 +115,7 @@ def main() -> None:
 
     step("authorships", """
         CREATE TABLE authorships AS
-        SELECT DISTINCT id AS paper_id, unnest(authors) AS author_name, bucket FROM raw
+        SELECT id AS paper_id, unnest(list_distinct(authors)) AS author_name, bucket FROM raw
     """)
 
     step("paper_keywords / keywords", """
