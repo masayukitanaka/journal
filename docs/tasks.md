@@ -461,3 +461,34 @@
 - **安全策**: 正しい年代バケットが `DB_REGISTRY`（`field17_2006_2010`〜`field17_2026_2030`）の範囲外（例: 1993年、2005年、1996年など）になるケースも複数検出されたが、未登録の DB への移動は行わずスキップする設計にしてあるため、該当論文はそのまま元の DB に残っている（既知の制約。範囲外年代の DB は本 PoC では作成していない）。
 - **R2 キャッシュのクリア**: 移動した22論文（ID変更含む）をシードとする R2 グラフキャッシュを個別に削除した。それ以外の論文（移動した論文を祖先・子孫として含むグラフ）のキャッシュは、次回そのシードにアクセスされた際に最新の D1 から再計算されるまで、古い値を保持したままになる制約が残る（根本的な自動無効化の仕組みは未実装、既存の DELETE エンドポイント参照）。
 - **未解決の関連事象**: OpenAlex が Work をマージした場合、D1 側のタイトルは移動前の古いタイトルのまま保持される（例: ID 4385245566 は実体が "Attention Is All You Need" にマージされているが、D1 上のタイトルは "Exploiting Generative AI to Scale up Intelligent Tutoring Systems" のまま）。今回のタスク（年の修正）の範囲外として対応していない。
+
+### 複数 dev サーバーインスタンス間での R2 キャッシュ不一致（2026-11-11〜12）
+
+- **発覚の経緯**: 上記の出版年修正・R2キャッシュクリア後、ユーザーが改めてブラウザで確認したところ、依然として "Attention Is All You Need" が2025年のノードとして（`From adjacent range` 付きで）表示された。
+- **原因**: ユーザーが見ていたのは `localhost:5174` という、作業に使っていた `localhost:5173` とは**別の dev サーバープロセス**（`npm run dev` を複数回起動していた）だった。両者は同じローカル R2 エミュレーション（`.wrangler/state/v3/r2/`）を共有しているが、5174 側のプロセスが先に生成・キャッシュしていたシードグラフ JSON が、D1 側の移動作業後も更新されずに残っていた。検索結果（D1 を直接見る）は正しい値を表示していたが、グラフのツールチップ（R2 キャッシュ経由）だけ古い値のままだったため、同じ画面内で表示が食い違って見えた。
+- **対応**: `localhost:5174` に対しても `DELETE /api/fields/17/seed`（一斉削除エンドポイント）を実行し、該当キャッシュを削除した（`localhost:5173` 側で同じ操作をしても 0 件だったことから、両ポートが同一の R2 ストレージを共有していることを確認）。
+- **教訓**: 同一プロジェクトで複数の dev サーバーを並行起動していると、ポートごとに「見た目は別アプリ」だが実体は同じ R2/D1 を共有するため、片方で検証した結果がもう片方にすぐ反映されない（しても古いキャッシュが残っている）ことがある。切り分け時はまずユーザーがどの URL・ポートを見ているかを確認するのが有効。
+
+### 論文詳細フェッチ中のローディング・エラーラベル追加（2026-11-12）
+
+- **背景**: ユーザーから「ノードを選択すると暫く時間がたってOpenAlexなどのリンクが表示される。フェッチに時間がかかるのは仕方ないが、取得中は『loading details』、失敗時は『Failed to load details』を表示してほしい」との要望（本番 D1 への `fetchPaper` 呼び出しが時々数秒かかったり、一時的に失敗することがあるため）。
+- **`src/App.tsx`**: `isLoadingDetail`・`detailError` state を追加。`handleSelect()` 内で `fetchPaper()` 呼び出しの前に `isLoadingDetail=true`・`detailError=false` にし、成功時はそのまま、失敗時は `catch` で `detailError=true` にして、`finally` で `isLoadingDetail=false` に戻す。`handleDeselect()` でも両方をリセットする。
+- **`src/components/SidePanel.tsx`**: props に `isLoadingDetail`・`detailError` を追加。「Selected paper」セクションの外部リンクの直前に、取得中は "Loading details..."（`var(--accent)` 色、ユーザー指示により `--muted-text` から変更）、失敗時は "Failed to load details"（`var(--warn-text)` 色）を表示する。
+- **動作確認**: ブラウザの `window.fetch` を一時的にパッチし、`/paper/{id}` 宛のリクエストのみ3秒遅延・その後失敗させる形でそれぞれ再現した。ローディング中は水色の "Loading details..."、失敗時は警告色の "Failed to load details" が正しく表示されることを確認した（確認用のパッチは確認後に元に戻した）。
+
+### 選択ノードの直接の親・子もハイライトするよう変更（2026-11-12）
+
+- **背景**: ユーザーから「ノードを選択するとハイライトされるが、子どもと親も一緒にハイライトしたい（詳細表示は選択ノードだけで良い）」との要望。確認の結果、範囲は「直接の親・子のみ（1ホップ）」に決定（全祖先・全子孫ではない）。
+- **`src/filters.ts`**: `resolveDirectNeighborIds(selectedId, edges)` を新規追加。選択ノード自身 + `edges` から見て直接つながる `cited`・`citing` 側の ID をすべて集めた `Set` を返す。既存の `resolveLineageIds`（被引用数最大の1本の祖先経路だけを辿る、詳細パネルの「Lineage (ancestors)」表示に現在も使用中）とは別の関数として追加した。
+- **`src/App.tsx`**: `GraphView` に渡す `lineageIds`（ハイライト対象の ID 集合）の計算を、`resolveLineageIds` から `resolveDirectNeighborIds` に差し替えた。詳細パネル表示（`selectedPaper`/`selectedAuthors`/`selectedKeywords`、Lineageパネルの祖先列挙）は変更していない。
+- **単体動作確認**: Node.js で `resolveDirectNeighborIds` 単体の入出力を検証し、ロジック自体が正しいことを確認した。
+- **ブラウザでの確認時に判明した制約**: 被引用数が極端に多い論文（例: "Deep Residual Learning for Image Recognition"、直接の子が141,580件）を選択すると、見た目上ハイライトされるノードが選択ノード自身とその祖先1件程度しかなく、「直接の子がハイライトされていない」ように見えた。React Fiber を直接検査して原因を特定したところ、実装（`resolveDirectNeighborIds`、及びそれが参照する `graph.edges`）自体に問題はなく、**`worker/graph.ts` の `buildSeedGraph` が持つ `MAX_NODES=2000` 件の上限**が原因だった。BFS の各階層で新規ノードを被引用数上位に絞って打ち切る設計（SPEC.md 6.5）のため、ResNet のような超高被引用論文の直接の子（14万件超）はこの選別でほとんど弾かれ、最終的な `edges` にそのエッジがほぼ残らない。「Swin Transformer」（被引用数33,262、子20,815件）を選択した際は `lineageIds` が2000件近くヒットし、正しく機能していることを確認した。
+- **対応方針（ユーザー確認済み）**: 今回は修正不要。MAX_NODES の制約下での巨大ハブ論文の扱いは既存の仕様上の制約であり、通常規模の論文（直接の子・親が数件〜数十件程度）では正しくハイライトされる。
+
+### パフォーマンス改善の調査とhubsエンドポイントのインデックス追加（2026-11-12）
+
+- **背景**: ユーザーから「読み込みに時間がかかりすぎて使い物にならないレベル」との指摘。セッション内の実測（検索API約30秒、buildSeedGraphのコールドパス22〜27秒等）とバックグラウンドforkによる追加調査（hubsエンドポイント実測8秒、検索の短い文字列でD1 CPU time limit超過・503クラッシュ、R2キャッシュが実際には機能していない疑い、paper詳細のN+1直列ループ等）を統合し、`docs/optimizing.md` にボトルネック一覧・優先度・改善案をまとめた。
+- **最初の対応（P0・最優先項目）**: `migrations/0006_add_child_cnt_index.sql` で `CREATE INDEX idx_papers_field_childcnt ON papers(field, child_cnt DESC)` を追加。`/api/fields/:field/hubs` が `child_cnt` でソートするのに対応するインデックスが無く、`field` 絞り込み後の全行（最大334万行/DB）をソートしていたことが原因だった。
+- **適用**: `wrangler d1 migrations apply --remote` で本番の全5DB（`field17_2006_2010`〜`field17_2026_2030`）に適用。`field17_2016_2020` で一度 `D1 DB storage operation exceeded timeout` エラーが出たが、実際にはインデックス作成自体は成功しており（`sqlite_master` で確認）、`migrations list` でも適用済み扱いになっていることを確認した（タイムアウトは応答待ち中に発生しただけで処理は完了していた）。
+- **効果（実測）**: D1への直接クエリで `sql_duration_ms` が約8秒 → **9.57ms**（約800倍）に短縮。`rows_read` も数百万行 → 50行に。フロントの初期表示で `fetchTop`/`fetchHubs` を `Promise.all` しているため、この1本の遅延が初期表示全体を縛っていた問題を解消した。
+- **残りの改善項目**: `docs/optimizing.md` に優先順位付きで記載（検索クエリの構造・短いクエリでの503クラッシュ対策、R2キャッシュの実効性検証、`resolveLineage`/`resolvePaper`のN+1直列ループの並列化、等）。次にどれから着手するかはユーザー指示待ち。

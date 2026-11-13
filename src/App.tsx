@@ -5,12 +5,16 @@ import { OperationBar } from "./components/OperationBar";
 import { GraphView } from "./components/GraphView";
 import { SidePanel } from "./components/SidePanel";
 import { fetchFields, fetchHubs, fetchPaper, fetchSeedGraph, fetchTop, type FieldInfo } from "./api";
-import { HUB_MIN_CHILD_DEFAULT, resolveLineageIds, resolveLineageSubtree, resolveSkeleton } from "./filters";
+import { HUB_MIN_CHILD_DEFAULT, resolveDirectNeighborIds, resolveLineageIds, resolveLineageSubtree, resolveSkeleton } from "./filters";
 import { SAMPLE_GRAPH } from "./sampleData";
 import type { GraphNode, KeywordInfo, PaperSummary, SeedGraph } from "./types";
 
 const TOP_CITED_SEED_FALLBACK = 2194775991; // Deep Residual Learning（被引用 1 位、2026-11 時点）
 const DEFAULT_FIELD = 17; // 計算機科学（SPEC.md 4.2）
+// 初期表示のシードグラフ取得のタイムアウト（2026-11-12、docs/optimizing.md 2.2）。
+// 超高被引用論文がデフォルトシードになった場合に D1 のレート制限で応答が数十秒〜振れることがあるため、
+// 「メインページ・年代切り替え時の表示は遅くても10秒以内」の目標を確実に守るためのフロント側の安全弁。
+const SEED_FETCH_TIMEOUT_MS = 8000;
 
 function App() {
 	const [graph, setGraph] = useState<SeedGraph>(SAMPLE_GRAPH);
@@ -42,6 +46,10 @@ function App() {
 	// 選択中論文の著者・キーワード（2026-11-11、SPEC.md 4.4。authorships/keywords テーブルから取得）。
 	const [selectedAuthors, setSelectedAuthors] = useState<string[]>([]);
 	const [selectedKeywords, setSelectedKeywords] = useState<KeywordInfo[]>([]);
+	// 選択中論文の詳細（fetchPaper）の取得中・失敗状態。本番 D1 への重いクエリがタイムアウト・一時エラーに
+	// なることがあり、何も表示されないまま待たされると分かりにくいとのユーザー指摘を受けて追加（2026-11-12）。
+	const [isLoadingDetail, setIsLoadingDetail] = useState(false);
+	const [detailError, setDetailError] = useState(false);
 	// サイドパネルはデフォルト非表示。論文選択時に自動で開く、または手動トグルで開閉する（表示エリアを広く保つため）。
 	const [panelOpen, setPanelOpen] = useState(false);
 	// 検索結果・top/hubs 一覧からの選択時に、GraphView へ「このノードへパン・ズームを強制的に合わせ直せ」と
@@ -96,7 +104,14 @@ function App() {
 				setHubPapers(hubsRes.papers);
 
 				const seedId = topRes.papers[0]?.id ?? TOP_CITED_SEED_FALLBACK;
-				const seedGraph = await fetchSeedGraph(field, yearRange, seedId, 2);
+				// 初期表示は depth=1 + タイムアウト（2026-11-12、パフォーマンス改善。docs/optimizing.md 2.2
+				// 「未解決の既知の制約」）。depth=2 だと、年代によってはデフォルトシードが超高被引用のハブ論文
+				// （例: field17_2006_2010 の ImageNet、直接の子44,573件）になり、D1のレート制限に抵触して
+				// 初期表示が10秒を大きく超えることを実測で確認した（24.8秒）。depth=1 でも一部の年代
+				// （例: field17_2011_2015、Top cited 上位が軒並み数万件規模の子を持つ）では D1 のレート制限
+				// による不安定性が残り、7〜93秒まで振れることを確認したため、SEED_FETCH_TIMEOUT_MS で
+				// 確実に打ち切り、タイムアウト時はサンプルデータ表示にフォールバックする。
+				const seedGraph = await fetchSeedGraph(field, yearRange, seedId, 1, 0, SEED_FETCH_TIMEOUT_MS);
 				if (cancelled) return;
 
 				setGraph(seedGraph);
@@ -104,7 +119,18 @@ function App() {
 				setLoadError(null);
 			} catch (err) {
 				if (!cancelled) {
-					setLoadError(err instanceof Error ? err.message : String(err));
+					const isTimeout = err instanceof DOMException && err.name === "AbortError";
+					// タイムアウト・失敗時は前の年代のグラフを表示し続けると誤解を招くため、
+					// サンプルデータ表示に明示的に戻す（2026-11-12）。
+					setGraph(SAMPLE_GRAPH);
+					setIsSample(true);
+					setLoadError(
+						isTimeout
+							? `seed graph request timed out after ${SEED_FETCH_TIMEOUT_MS / 1000}s`
+							: err instanceof Error
+								? err.message
+								: String(err),
+					);
 				}
 			} finally {
 				if (!cancelled) setIsLoadingGraph(false);
@@ -165,8 +191,10 @@ function App() {
 	// キーボードナビゲーションが表示件数などの絞り込み範囲外へ出た場合に備え、グラフ全体も GraphView に渡す。
 	const allNodesById = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n])), [graph.nodes]);
 
+	// グラフ上のハイライト対象: 選択ノード自身 + 直接の親・子（1ホップ）。詳細パネルの表示対象
+	// （選択ノードのみ）とは別で、ハイライト表示だけ親子も含めるようユーザーが要望（2026-11-12）。
 	const lineageIds = useMemo(
-		() => (selectedId !== null ? resolveLineageIds(selectedId, graph.nodes, graph.edges) : new Set<number>()),
+		() => (selectedId !== null ? resolveDirectNeighborIds(selectedId, graph.edges) : new Set<number>()),
 		[selectedId, graph],
 	);
 
@@ -196,6 +224,8 @@ function App() {
 			});
 
 			if (!isSample) {
+				setIsLoadingDetail(true);
+				setDetailError(false);
 				try {
 					const detail = await fetchPaper(field, yearRange, id);
 					setLineage(detail.lineage);
@@ -207,6 +237,9 @@ function App() {
 					setSelectedPaper(null);
 					setSelectedAuthors([]);
 					setSelectedKeywords([]);
+					setDetailError(true);
+				} finally {
+					setIsLoadingDetail(false);
 				}
 			} else {
 				setSelectedPaper(null);
@@ -223,6 +256,8 @@ function App() {
 		setSelectedPaper(null);
 		setSelectedAuthors([]);
 		setSelectedKeywords([]);
+		setIsLoadingDetail(false);
+		setDetailError(false);
 	}, []);
 
 	const handleResetView = useCallback(() => {
@@ -345,6 +380,8 @@ function App() {
 						selectedPaper={selectedPaper}
 						selectedAuthors={selectedAuthors}
 						selectedKeywords={selectedKeywords}
+						isLoadingDetail={isLoadingDetail}
+						detailError={detailError}
 						lineage={lineage}
 						topPapers={topPapers}
 						hubPapers={hubPapers}

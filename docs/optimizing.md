@@ -1,0 +1,243 @@
+# パフォーマンス改善案（optimizing.md）
+
+- ステータス: ドラフト（調査結果と改善案のまとめ、2026-11-12）
+- 背景: 「読み込みに時間がかかりすぎて使い物にならないレベル」というユーザー指摘を受けて作成。
+- 前提: [docs/SPEC.md](./SPEC.md)、[docs/ARCHITECT.md](./ARCHITECT.md)
+
+---
+
+## 1. 現状の実測値・事実
+
+このセッション中に実際に観測した数値。
+
+| 項目 | 値 | 出典 |
+|---|---|---|
+| 検索API（`/api/fields/17/search`、タイトル・著者・キーワードLIKE検索）の応答時間 | 約 30,827 ms | `field17_2021_2025` への直接 `wrangler d1 execute` 実測（`sql_duration_ms: 30827.2208`） |
+| 同上、別クエリ | 約 15,290〜19,202 ms | 複数回実測、年代DBによってばらつきあり |
+| シードグラフ構築（`buildSeedGraph`、depth=2）がローカル dev サーバー経由で本番 D1 に投げた際の挙動 | 503 エラー・`D1 DB exceeded its CPU time limit and was reset`・`Network connection lost` が散発 | devサーバーログ実測 |
+| `field17_2021_2025` の `edges` テーブル行数 | 32,930,415 件 | `SELECT COUNT(*) FROM edges` 実測 |
+| `field17_2021_2025` の `papers` テーブル行数 | 3,340,772 件 | 実測 |
+| 全5DB合計の `papers` 行数 | 約 11,438,011 件 | 実測（2006-2010: 1,932,850 / 2011-2015: 2,436,353 / 2016-2020: 2,693,374 / 2021-2025: 3,340,772 / 2026-2030: 1,034,662） |
+| `field17_2021_2025` の D1 database_size | 4.77 GB | `wrangler d1 info` 実測 |
+| `field17_2021_2025` の read_replication.mode | **disabled** | `wrangler d1 info` 実測 |
+| `field17_2021_2025` の rows_read（直近24h） | 399,189,429 行 | `wrangler d1 info` 実測 |
+| `wrangler.jsonc` の Smart Placement | **未設定（コメントアウトされたまま）** | `wrangler.jsonc:21` |
+| フロントの性能目標（SPEC.md 6.5） | 「表示ノード600件で描画反映が100ms以内」のみ。**バックエンドAPI応答時間の目標値が存在しない** | `docs/SPEC.md` |
+| `/api/fields/17/hubs` の応答時間 | **約 8,012 ms**（`/api/fields/17/top` の 264 ms と比べて約30倍） | ローカルdevサーバー経由での実測（別調査） |
+| 検索APIに短い文字列（`q=a`）を投げた場合 | **94ms で 503（CPU time limit 超過でWorkerごとクラッシュ）** | ローカルdevサーバー経由での実測（別調査）。タイムアウトより悪い障害モード |
+| `buildSeedGraph` のコールドパス（高被引用論文をシードにした場合） | **22〜27秒**（depth=1でもdepth=2でもほぼ同じ） | ローカルdevサーバー経由での実測（別調査、シード: 被引用33,262件のSwin Transformer） |
+| 同一シード・同一depthへの2回目以降のアクセス | **`x-data-source: d1-direct` のまま、速度改善なし** | ローカルdevサーバー経由での実測（別調査）。R2キャッシュが機能していないことを示唆。本番環境での再現は未検証 |
+
+---
+
+## 2. ボトルネック候補（優先度順）
+
+### 2.0 【P0・最優先・一発で直る】`hubs` エンドポイントのインデックス欠如 ✅ 対応済み（2026-11-12）
+
+**対応内容**: `migrations/0006_add_child_cnt_index.sql` で `CREATE INDEX idx_papers_field_childcnt ON papers(field, child_cnt DESC);` を追加し、本番の全5DB（`field17_2006_2010`〜`field17_2026_2030`）に `wrangler d1 migrations apply --remote` で適用済み。
+
+**効果（実測）**:
+- D1への直接クエリ（`field17_2021_2025`、`WHERE field=17 AND child_cnt>=4 ORDER BY child_cnt DESC LIMIT 50`）: 対応前は数百万行を読んでソート（約8秒） → 対応後 `sql_duration_ms: 9.57ms`・`rows_read: 50`（**約800倍の高速化**）。
+- `/api/fields/17/hubs` エンドポイント経由（ローカルdevサーバー経由で本番D1）: 0.62秒（ネットワーク往復・Cache-Controlの影響を含む）。
+
+**実測（対応前、参考値）**: `/api/fields/17/hubs` が約 **8,012 ms**。同じ構造の `/api/fields/17/top` は264msで終わる。
+
+**原因**: `worker/api/hubs.ts` のクエリ `WHERE field = ? AND child_cnt >= ? ORDER BY child_cnt DESC` に対応するインデックスが無い（`migrations/0001` には `idx_papers_field_year`・`idx_papers_field_cit` のみで `child_cnt` 用が無い）。`top` は `idx_papers_field_cit` が効くため速いが、`hubs` は毎回 `field` 絞り込み後の全行をソートしている。
+
+**致命的な理由**: フロントの初期ロードで `fetchTop` と `fetchHubs` を `Promise.all` で並列実行しているため（`src/App.tsx`）、**速い方（top）が終わっていても遅い方（hubs）が初期表示全体を8秒ブロックする**。ユーザーが「読み込みに時間がかかりすぎる」と最初に体感する箇所はここである可能性が高い。
+
+**対応（1マイグレーションで完了）**:
+```sql
+CREATE INDEX idx_papers_field_childcnt ON papers(field, child_cnt DESC);
+```
+実装コスト最小・効果最大。**真っ先にこれだけでもやる価値がある。**
+
+---
+
+### 2.1 【P0・最優先・体感への影響大】検索API（`/api/fields/:field/search`）のクエリ構造
+
+**現状のクエリ**（`worker/api/search.ts`）:
+
+```sql
+SELECT ... FROM papers p
+WHERE p.field = ?
+  AND (
+    p.title LIKE '%...%' ESCAPE '\'
+    OR EXISTS (SELECT 1 FROM authorships a WHERE a.paper_id = p.id AND a.author_name LIKE '%...%' ESCAPE '\')
+    OR EXISTS (SELECT 1 FROM paper_keywords pk JOIN keywords k ON k.id = pk.keyword_id WHERE pk.paper_id = p.id AND k.name LIKE '%...%' ESCAPE '\')
+  )
+ORDER BY p.cit DESC LIMIT ?
+```
+
+**何が遅いか**:
+- `p.title LIKE '%...%'`（先頭ワイルドカード）はインデックスを使えずフルスキャンになる。
+- **OR で3条件（title / authorships EXISTS / paper_keywords EXISTS）をつないでいるため、SQLite のクエリプランナーは `field` で絞り込んだ後の全行（field17 で言えば最大 334万行、全DB合計1,144万行オーダー）に対して、1行ごとに3つの条件を評価する**。2つの EXISTS サブクエリは行ごとに評価されるため、実質的に「全論文 × authorships 検索」「全論文 × paper_keywords 検索」を行っているのに等しい。
+- `papers.title` にインデックスが無い（`idx_papers_field_year`・`idx_papers_field_cit` のみ）。
+- 実測 15〜31秒はこの構造が原因と判断できる。
+
+**重大な追加実測**: 検索語が短い場合（`q=a`）、**94msで503エラー（D1 DB CPU time limit 超過）になり、タイムアウトではなくWorkerごとクラッシュする**。短い文字列ほど一致行数が爆発的に増え、EXISTSサブクエリの評価コストが跳ね上がるため、長いクエリより短いクエリの方が危険という逆説的な状況になっている。ユーザーが検索ボックスに1文字入力するたびに発火する設計（`onChange`即検索）と組み合わさると、**タイプ中に毎回503を引く**実質使用不能な状態になりうる。
+
+**すぐ試せる小さい変更**:
+1. **最低クエリ長のバリデーションを追加する（最優先・即効）**: 例えば2〜3文字未満は検索を実行せず400エラーまたは空配列を返す。これだけで503クラッシュの大半を防げる。フロント側（`SidePanel.tsx`の`SearchBox`）でも同様に、一定文字数未満は`searchPapers`を呼ばないようにする。
+2. **クエリを3本に分割して `UNION`** する（title 検索・authorships 検索・keywords 検索をそれぞれ独立したインデックス効くクエリにし、アプリ側かSQLの `UNION` でマージする）。OR 条件を外すだけで、各クエリが対応するインデックスを使えるようになる可能性が高い。
+3. **`LIKE` を前方一致（`'word%'`）に変更できないか検討する**。前方一致ならインデックスが効く。ユーザー体験として部分一致が必須かどうかを再検討する価値がある（タイトル検索は前方一致でも多くのケースで実用上十分なことが多い）。
+4. **`authorships(paper_id)` はインデックスがあるが `EXISTS` 内の相関サブクエリとして使われているため、外側のクエリ自体の絞り込みには寄与していない** — クエリ構造を変えない限り効果が薄い。
+
+**設計変更が必要な大きい変更**:
+1. **D1 の FTS5（全文検索）相当の仕組みを導入する**（`ARCHITECT.md` 7-5 で既に「速度が問題になれば検討する」と明記されている対応）。具体的には:
+   - `papers_fts` のような FTS5 仮想テーブルを作り、`title` を全文検索インデックス化する。
+   - 著者名・キーワードも同様に FTS5 テーブル化するか、`papers_fts` に非正規化して含める（1論文1行に著者名・キーワードを連結したテキストとして持たせる案）。
+   - D1 は SQLite 互換なので FTS5 拡張が使える（要確認: Cloudflare D1 のFTS5サポート状況を事前に検証する）。
+2. **検索対象を絞ったマテリアライズドビュー的なテーブルを ingest 時に作る**（例: `papers_search(paper_id, field, title, cit, combined_text)` のような非正規化テーブルを事前構築し、`combined_text` に title + 著者名 + キーワードを連結して1つのFTS5インデックスで検索する）。ingest パイプライン（`scripts/ingest/`）側の変更が必要。
+3. **外部の全文検索サービス**（Cloudflare Vectorize、Algolia、Meilisearch等）に検索機能だけ切り出す案。実装コストは高いが、将来的に検索要件が増えるなら有力。
+
+---
+
+### 2.2 【優先度高】シードグラフ構築（`buildSeedGraph`）のD1ラウンドトリップ回数
+
+**現状の処理**（`worker/graph.ts`）:
+- BFS を `depth`（既定2、最大3）回繰り返す。
+- 各階層で「祖先方向」「子孫方向」それぞれ `fetchEdgesChunked` を呼び、`SQL_IN_CHUNK_SIZE=90` 件ずつ `WHERE citing/cited IN (...)` のチャンクに分割して D1 に問い合わせる。
+- 新規ノードの論文情報取得（`fetchPapersWithAdjacent`）も同様に90件チャンクで D1 に問い合わせる。
+- **1階層の frontier が仮に 500 件あれば、祖先検索・子孫検索だけで `ceil(500/90) × 2 = 12` 回の D1 ラウンドトリップが発生し、depth=2 なら単純計算で24回以上、論文情報取得も合わせるとさらに増える**。
+- 隣接DB補完（`fetchEdgesChunkedWithAdjacent`・`fetchPapersWithAdjacent`）が有効な場合、隣接DBの数だけ追加のラウンドトリップが発生する（最大2DB分）。
+- 被引用数が極端に多い論文（例: ResNet、直接の子が14万件超）をシードにすると、`uniqueNewIds` が巨大になり、チャンク数・ラウンドトリップ数が跳ね上がる。
+
+**何が遅いか**:
+- D1 はリクエストごとにネットワークラウンドトリップのレイテンシがあり、**ラウンドトリップ回数がそのまま応答時間に直結する**。チャンク分割のため、ノード数が増えるほど線形に回数が増える設計になっている。
+- `Promise.all` で祖先・子孫方向は並列化されているが、**チャンクごとのループ（`for`）は直列**（`fetchEdgesChunked` 内の `for` ループは `await` を直列に実行している）。これは意図的（D1への同時接続数の制御）かもしれないが、並列化できる余地がある。
+
+**すぐ試せる小さい変更**:
+1. **`fetchEdgesChunked` 内のチャンクループを `Promise.all` で並列化する**。現在は `for (...) { await ... }` で直列実行しているため、チャンク数が多いほど待ち時間が線形に伸びる。D1の同時接続数制限内であれば並列化で大きく短縮できる可能性が高い。
+2. **`SQL_IN_CHUNK_SIZE` を90から可能な限り引き上げる**（D1のバインド変数上限100に対して現在90、安全マージンを削って95程度まで等）。効果は小さいが無料。
+3. **`SEED_DEPTH_DEFAULT` を2から1に下げる**ことを検討する（UI側で「もっと見る」的な追加読み込みに変える）。初期表示の体感速度を優先するなら depth=1 でまず表示し、depth=2 以降は非同期で追加取得する設計に変える。
+
+**設計変更が必要な大きい変更**:
+1. **BFSをD1側のSQL（再帰CTE: `WITH RECURSIVE`）に寄せる**。現状はアプリ側（Worker）でBFSの各階層を制御し、都度D1に問い合わせているが、SQLiteの再帰CTEを使えば1回のクエリ（1ラウンドトリップ）でdepth階層分を一度に取得できる可能性がある。ただし `MAX_NODES` による打ち切り・被引用数上位への絞り込みをCTE内でどう表現するかは設計が必要。
+2. **D1 Sessions API / Read Replication を有効化する**（2.4節参照）。読み取りクエリのレイテンシを地理的に分散させられる。
+3. **事前計算・プリウォーミング**: 被引用数上位N件（Top cited/Top hubs に出てくる論文）のシードグラフは、ingest/日次バッチのタイミングで先にR2に生成しておく。ユーザーが実際にクリックする前に候補を予測して温めておく。
+
+---
+
+### 2.3 【優先度中】R2グラフキャッシュのヒット率と初回リクエストの体感
+
+**現状の設計**（`worker/api/seed.ts`、`worker/index.ts`）:
+- R2 にキャッシュがあれば `X-Data-Source: r2-cache` で即座に返す。
+- 無ければ `d1-direct` でその場で重い BFS を実行して応答し、**同時に** `GRAPH_BUILD_QUEUE` へメッセージを送って非同期に R2 へ書き込む。
+- Queue コンシューマ（`worker/index.ts` の `queue()`）は、**初回リクエストを処理したWorkerインスタンスと全く同じ重い `buildSeedGraph` をもう一度最初から実行する**（結果を使い回していない、二重計算）。
+
+**何が遅いか**:
+- **初回アクセスしたユーザー自身は常に `d1-direct` の重い計算を待たされる**。R2キャッシュは「次に同じシードを見る別のユーザー・同じユーザーの再訪」にしか効かない。
+- Queue側で同じ計算をもう一度行っているのは無駄な D1 負荷（2.1節の `rows_read_24h: 3.99億行` の一因になっている可能性がある）。
+- **実測で判明した重大な事実**: 同一シード・同一depthへ2回目以降にアクセスしても、`x-data-source: d1-direct` のままで速くならないことを確認した（ローカルdev環境）。つまり**R2キャッシュが意図通りに機能していない**。Queueコンシューマの実行タイミングが間に合っていない可能性、またはローカルdev特有の問題の可能性があり、**本番環境での再現有無は別途検証が必要**（このドキュメント作成時点では未検証）。
+- **設計上の不整合（バグ）**: キャッシュキー `graphKey(field, seed, depth)` には `minCit` パラメータが含まれていないが、`GET /seed/:id` は任意の `minCit` を受け付ける一方、Queue側は常に `minCit=0` でグラフを構築してR2に書き込む。そのため、異なる `minCit` でのリクエストが同じキャッシュキーを取り合い、**ユーザーが指定した `minCit` と異なる（絞り込みがされていない）グラフがキャッシュから返ってくる**可能性がある。
+
+**すぐ試せる小さい変更**:
+1. **初回リクエストで計算した `graph` オブジェクトを、Queueに送るのではなく、そのリクエスト処理の中で直接R2に書き込む**（`await c.env.BUCKET_FIELD17.put(...)` をレスポンスを返す前後に追加するだけ）。Queue送信・二重計算を無くせる。非同期化したい意図（レスポンスを遅らせたくない）があるなら `c.executionCtx.waitUntil()` を使えば、レスポンスを即座に返しつつバックグラウンドでR2書き込みだけ行え、二重計算を避けられる。
+2. **キャッシュキーに `minCit` を含める**（例: `graph/field{N}/seed-{id}-d{depth}-m{minCit}.json`）。これだけで「意図しない絞り込み違いのグラフが返る」不整合を解消できる。
+3. **よくアクセスされるシード（Top cited/Top hubsに出てくる論文）を、ingest完了直後やcronで先にR2にウォームアップしておく**。「初めて見るユーザーも大抵は同じ人気論文から見始める」という前提が成り立つなら効果が大きい。
+4. **R2キャッシュが本当に機能しているかを本番環境で再検証する**（最優先の調査タスク）。`X-Data-Source` ヘッダーを見ながら同一シードに複数回アクセスし、2回目以降が `r2-cache` になるか確認する。
+
+**設計変更が必要な大きい変更**:
+1. **キャッシュのバージョニング**（このセッションで何度も手動でR2キャッシュを消す羽目になった問題への恒久対応）。グラフ生成ロジックのバージョン番号をキーに埋め込み、ロジック変更時に自動的に新しいキーになるようにする。
+
+---
+
+### 2.3b 【優先度中〜高】`/api/fields/:field/paper/:id`（論文詳細）のN+1直列ループ
+
+**現状**（`worker/api/paper.ts`）:
+- `resolveLineage()` は最大20階層のループで祖先を1件ずつ辿る。各階層で `edges` クエリ1本 + `papers` クエリを**メインDB・隣接DB分だけ `for...of` で直列に** await する（`for (const db of [database, ...adjacentDbs])`）。
+- `resolvePaper()` も同様に、論文がどのDBにあるか探索する際、メインDB→隣接DBの順に**直列**で問い合わせる。
+- 理論上、隣接DBが2つある場合、1階層あたり最大3回の直列D1呼び出しが発生し、20階層分まで回ると**最大80ラウンドトリップ**に達しうる。
+
+**何が遅いか**: 論文詳細パネルを開く（ノードを選択する）たびにこの処理が走る。「ノードを選択してから暫く時間が経ってOpenAlexなどのリンクが表示される」というユーザーの以前の指摘は、この直列ループが一因である可能性が高い。
+
+**すぐ試せる小さい変更**:
+1. **`for (const db of [database, ...adjacentDbs])` を `Promise.all` に変える**（メインDB・隣接DBへの問い合わせは互いに独立しているため、並列化しても結果の正しさに影響しない）。
+2. `resolveLineage()` の各階層内の「メインDB + 隣接DB」問い合わせも同様に並列化する。
+3. 階層間（祖先を1つ遡るたびに次の階層へ進む部分）は本質的に前の結果に依存するため直列のままで構わないが、各階層内の処理は並列化の余地が大きい。
+
+---
+
+### 2.4 【優先度中】D1 Read Replication / Sessions API が無効のまま
+
+**現状**:
+- `wrangler d1 info` で `read_replication.mode: disabled` を確認。
+- D1 には Read Replication（Sessions API）機能があり、有効化すると読み取りクエリを地理的に近いレプリカに振り分けられる（書き込みはプライマリのみ）。
+
+**改善案（設計変更、ただし設定変更のみで試せる）**:
+1. Cloudflare D1 の Read Replication を有効化する（`wrangler d1 create`時のオプション、または既存DBに対する設定変更。Cloudflareダッシュボード/APIで確認）。
+2. Worker 側で D1 Sessions API（`env.DB.withSession(...)`）を使い、読み取り専用のエンドポイント（top/hubs/search/seed/paper）はセッション経由でレプリカから読む。
+3. 本アプリは書き込みが日次ingestのみ・読み取りが大半（ユーザートラフィック）という特性上、Read Replicationとの相性が良い。
+
+---
+
+### 2.5 【優先度中】インデックス不足
+
+**現状のインデックス一覧**（`migrations/*.sql`より）:
+
+| テーブル | インデックス |
+|---|---|
+| `papers` | `(field, year)` / `(field, cit DESC)` |
+| `edges` | PRIMARY KEY `(cited, citing)` / `(citing)` |
+| `authorships` | `(paper_id)` / `(author_name)` |
+| `paper_keywords` | PRIMARY KEY `(paper_id, keyword_id)` / `(keyword_id)` |
+| `keywords` | PRIMARY KEY `(id)` |
+
+**欠けているもの**:
+- `papers(title)` — LIKE検索の対象だが、前方一致でもない限りインデックスの恩恵は薄い（2.1節のFTS5対応が本筋）。
+- `papers(field, child_cnt DESC)` — `/api/fields/:field/hubs` が `child_cnt` でソートしているが使えるインデックスが無い。対応は2.0節を参照（実測8秒の直接原因、最優先で追加すべきインデックス）。
+
+---
+
+### 2.6 【優先度低〜中】フロントエンドの初期ロードシーケンス
+
+**現状**（`src/App.tsx`）:
+```
+fetchFields()
+  → (field/yearRange確定後)
+  → Promise.all([fetchTop(), fetchHubs()])
+  → fetchSeedGraph(topPapers[0].id, depth=2)
+```
+`fetchTop`・`fetchHubs` は並列化済み（ただし2.0節の通り`hubs`自体が8秒かかるため並列化の恩恵が相殺されている）。さらに `fetchSeedGraph` は `topPapers` の結果（1位の論文ID）が確定してからでないと開始できず、**直列の待ち時間がそのまま積み上がる**（fields → top/hubs → seed の3段階）。
+
+**見落とされがちな点**: `DEFAULT_FIELD = 17` は `src/App.tsx` 冒頭で既知の定数として定義されている。にもかかわらず `fetchFields()` の完了を待ってから次の処理（top/hubs取得）に進む構造になっており、**`fetchFields()` 自体が持つ情報（分野一覧・既定年代レンジ）がドロップダウンの表示にしか使われていないのに、本来並列化できるはずの1ラウンドトリップ分を無駄に直列化している**。
+
+**すぐ試せる小さい変更**:
+1. `fetchFields()` と `fetchTop(DEFAULT_FIELD, ...)`/`fetchHubs(DEFAULT_FIELD, ...)` を同時に発火する（`fetchFields`は分野セレクトボックスの描画にのみ使い、データ取得側は`DEFAULT_FIELD`で即座に開始する）。ただし `defaultYearRange` が `fetchFields` の結果に依存する設計（2026-11-11に追加済み）のため、year Rangeをどう扱うかは要検討（yearRange未指定でリクエストし、確定後に必要なら再取得する等）。
+2. `fetchSeedGraph` のシードに「top著者の1位」ではなく、**固定のフォールバックID（`TOP_CITED_SEED_FALLBACK`）を使って `fetchTop` と並行開始**し、後から本来のトップ論文のシードに差し替える2段階ロードにする。初期表示までの体感を早める。
+3. ローディングスピナー（既存実装）に加えて、**スケルトン表示**（グラフの輪郭だけ先に薄く表示）を検討する。
+
+---
+
+### 2.7 【優先度低】Smart Placement 未設定
+
+`wrangler.jsonc` の `placement: { mode: "smart" }` がコメントアウトされたまま。D1がWNAMリージョンにあるため、Workerの実行位置がD1から離れていると追加レイテンシが発生する。Smart Placementを有効にすると、CloudflareがWorkerの実行位置をD1に近いリージョンへ自動的に寄せてくれる可能性がある。**設定を1行有効化するだけで試せる**。
+
+---
+
+## 3. 推奨する着手順序
+
+実測値（セクション1）に基づき、**効果が確実で実装コストが最小のものから順**に並べた。
+
+1. ✅ **対応済み（2026-11-12）**: **`idx_papers_field_childcnt` インデックスを追加する**（2.0, 2.5）。実測で `hubs` のSQL実行時間が約8秒→9.57msに短縮（約800倍）。マイグレーション1本・全5DBに適用完了。
+2. **（最優先・即効・安全性にも関わる）検索クエリに最低文字数バリデーションを追加する**（2.1「すぐ試せる」1番）。短い検索語でD1がCPU time limit超過・Workerクラッシュ（503）することを実測済み。ユーザーが検索ボックスに文字を打ち込むたびに発火する設計と組み合わさると実用に耐えないため、体感速度以前に安定性の問題として最優先で直す。
+3. **（即効）`resolveLineage`/`resolvePaper` の隣接DB直列ループを `Promise.all` 化する**（2.3b）。ノード選択時の詳細表示の遅さに直結。
+4. **（即効）R2キャッシュが本番で実際に機能しているか検証する**（2.3「すぐ試せる」4番）。機能していない場合、キャッシュに期待していた効果がそもそも出ていないことになるため、他の改善より先に実態を把握する必要がある。
+5. **（即効）検索クエリをUNION形式に分割する**（2.1「すぐ試せる」2番）。実装コストは中程度だが、検索の体感改善が最も大きいと予想される。
+6. **（即効）`fetchEdgesChunked`のチャンクループを並列化する**（2.2「すぐ試せる」1番）。グラフ表示の体感速度に直結。
+7. **（即効）Smart Placementを有効化する**（2.7）。設定1行。
+8. **（中期）R2書き込みの二重計算を解消し、`waitUntil`でバックグラウンド書き込みに変え、キャッシュキーに`minCit`を含める**（2.3「すぐ試せる」1・2番）。
+9. **（中期〜長期）D1 Read Replication / Sessions APIを有効化する**（2.4）。
+10. **（長期・根本対応）FTS5等の全文検索基盤を導入する**（2.1「設計変更」1・2番）。検索の遅さの根本原因はここにあるため、2・5で応急処置をしても限界があり、最終的にはここに着手する必要がある。
+
+---
+
+## 4. 未確定事項
+
+1. Cloudflare D1 が FTS5 拡張を実際にサポートしているか（ドキュメント確認・簡易検証が必要）。
+2. Read Replication が現在のプラン（Workers Paid）で利用可能か、追加コストが発生するか。
+3. `fetchEdgesChunked` のチャンクループを並列化した場合の、D1側の同時接続数制限・レートリミットへの抵触有無（並列化前に小規模な負荷テストが必要）。
+4. シードグラフ構築をSQL側の再帰CTEに寄せる場合の実装コストと、`MAX_NODES`上限ロジックとの両立可否。
+5. **R2グラフキャッシュが本番環境でも機能していないのか、ローカルdev環境特有の問題なのか**（セクション2.3参照、ローカルでは2回目以降のアクセスでも`d1-direct`のままであることを実測済みだが、本番での検証は未実施）。
+6. キャッシュキーに`minCit`を含めた場合の、既存キャッシュ（`minCit`なしのキー形式）との互換性・移行方法。

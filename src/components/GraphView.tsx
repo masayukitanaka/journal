@@ -10,6 +10,7 @@ interface GraphViewProps {
 	allNodesById: Map<number, GraphNode>;
 	allEdges: [number, number][];
 	selectedId: number | null;
+	// ハイライト対象のノード ID 集合（選択ノード自身 + 直接の親・子、2026-11-12）。これ以外は薄く表示する。
 	lineageIds: Set<number>;
 	onSelect: (id: number) => void;
 	onDeselect: () => void;

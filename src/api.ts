@@ -8,12 +8,18 @@ export interface FieldInfo {
 	defaultYearRange: string | null; // yearRange 未指定時に実際に使われるレンジ
 }
 
-async function getJson<T>(url: string): Promise<T> {
-	const res = await fetch(url);
-	if (!res.ok) {
-		throw new Error(`request failed: ${res.status} ${url}`);
+async function getJson<T>(url: string, timeoutMs?: number): Promise<T> {
+	const controller = timeoutMs !== undefined ? new AbortController() : undefined;
+	const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+	try {
+		const res = await fetch(url, controller ? { signal: controller.signal } : undefined);
+		if (!res.ok) {
+			throw new Error(`request failed: ${res.status} ${url}`);
+		}
+		return (await res.json()) as T;
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
 	}
-	return res.json() as Promise<T>;
 }
 
 function withYearRange(url: string, yearRange?: string): string {
@@ -45,8 +51,9 @@ export function fetchSeedGraph(
 	seedId: number,
 	depth = 2,
 	minCit = 0,
+	timeoutMs?: number,
 ): Promise<SeedGraph> {
-	return getJson(withYearRange(`/api/fields/${field}/seed/${seedId}?depth=${depth}&minCit=${minCit}`, yearRange));
+	return getJson(withYearRange(`/api/fields/${field}/seed/${seedId}?depth=${depth}&minCit=${minCit}`, yearRange), timeoutMs);
 }
 
 export function searchPapers(

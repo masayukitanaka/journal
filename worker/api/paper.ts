@@ -1,6 +1,27 @@
 import { Hono } from "hono";
 import { listAdjacentDbs, resolveFieldDb, type PaperRow } from "../db.js";
 
+// D1（Workers Binding API 経由）のバインド変数上限は 100（worker/graph.ts と同じ制約、ARCHITECT.md 3.4）。
+// resolveLineage は祖先候補（1論文の参考文献数）をそのまま IN (...) に展開していたため、
+// 参考文献が 100 件を超える論文（例: 拡張版ジャーナル論文）を選択すると
+// "D1_ERROR: too many SQL variables" で全体が失敗し、詳細パネルに "Failed to load details" が
+// 表示され続けるバグになっていた（2026-11-13、ユーザー報告で発覚）。
+const SQL_IN_CHUNK_SIZE = 98;
+
+async function fetchPapersByIdsChunked(database: D1Database, ids: number[]): Promise<PaperRow[]> {
+	const results: PaperRow[] = [];
+	for (let i = 0; i < ids.length; i += SQL_IN_CHUNK_SIZE) {
+		const chunk = ids.slice(i, i + SQL_IN_CHUNK_SIZE);
+		const placeholders = chunk.map(() => "?").join(",");
+		const { results: rows } = await database
+			.prepare(`SELECT id, field, title, year, cit, fwci, subfield, child_cnt, doi FROM papers WHERE id IN (${placeholders})`)
+			.bind(...chunk)
+			.all<PaperRow>();
+		results.push(...rows);
+	}
+	return results;
+}
+
 // GET /api/fields/:field/paper/{id} — 論文の詳細と系譜（祖先の列）（SPEC.md 2章「系譜」, 5章）
 // id（OpenAlex ID）は分野をまたいで一意だが、分野・年代ごとに DB を分けているため、
 // どの DB を見るかの指定に :field パスパラメータが必要。
@@ -94,16 +115,10 @@ async function resolveLineage(database: D1Database, adjacentDbs: D1Database[], s
 		const candidateIds = candidateEdges.map((e) => e.cited).filter((id) => !visited.has(id));
 		if (candidateIds.length === 0) break;
 
-		const placeholders = candidateIds.map(() => "?").join(",");
 		let candidates: PaperRow[] = [];
 		for (const db of [database, ...adjacentDbs]) {
-			const { results } = await db
-				.prepare(
-					`SELECT id, field, title, year, cit, fwci, subfield, child_cnt, doi FROM papers WHERE id IN (${placeholders})`,
-				)
-				.bind(...candidateIds)
-				.all<PaperRow>();
-			for (const row of results) {
+			const rows = await fetchPapersByIdsChunked(db, candidateIds);
+			for (const row of rows) {
 				if (!candidates.some((c) => c.id === row.id)) candidates.push(row);
 			}
 		}

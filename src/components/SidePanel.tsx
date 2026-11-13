@@ -9,6 +9,10 @@ interface SidePanelProps {
 	selectedPaper: PaperSummary | null;
 	selectedAuthors: string[];
 	selectedKeywords: KeywordInfo[];
+	// 選択中論文の詳細（fetchPaper）の取得中・失敗状態。本番 D1 への重いクエリが数秒かかったり、
+	// 一時的にタイムアウトすることがあるため、その間・失敗時にラベルを表示する（2026-11-12）。
+	isLoadingDetail: boolean;
+	detailError: boolean;
 	lineage: PaperSummary[];
 	topPapers: PaperSummary[];
 	hubPapers: PaperSummary[];
@@ -29,6 +33,8 @@ export function SidePanel({
 	selectedPaper,
 	selectedAuthors,
 	selectedKeywords,
+	isLoadingDetail,
+	detailError,
 	lineage,
 	topPapers,
 	hubPapers,
@@ -72,6 +78,12 @@ export function SidePanel({
 						<div style={{ color: "var(--muted-text)", marginBottom: 8 }}>
 							{formatYearMonth(selectedNode.y)} · {formatCitationCount(selectedNode.c)} · {formatChildCount(selectedNode.k)}
 						</div>
+						{isLoadingDetail && (
+							<div style={{ color: "var(--accent)", marginBottom: 10 }}>Loading details...</div>
+						)}
+						{detailError && (
+							<div style={{ color: "var(--warn-text)", marginBottom: 10 }}>Failed to load details</div>
+						)}
 						<ExternalLinks paper={selectedPaper} />
 						{selectedAuthors.length > 0 && (
 							<div style={{ marginBottom: 8, color: "var(--muted-text)" }}>{selectedAuthors.join(", ")}</div>

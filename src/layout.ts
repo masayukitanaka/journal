@@ -140,16 +140,47 @@ export function nodeRadius(childCount: number): number {
 	return MIN_RADIUS + Math.log10(childCount + 1) * RADIUS_SCALE;
 }
 
-// SPEC.md 6.2: 円の色は分岐 0 は灰色、分岐がある論文は琥珀色から赤へ（分岐の多さに比例）。
+// SPEC.md 6.2: 円の色は分岐 0 は灰色、分岐がある論文は灰→白→薄黄→橙→赤→濃い紫へ（分岐の多さに比例）。
+// 分岐数の分布は対数的に偏る（平均 14、最大 20000件超、2026-11 実測）ため、
+// 色の補間も半径と同じ対数スケールで行う（線形補間だと大半のノードが同じ色になり見分けがつかなくなるため、2026-11-12 変更）。
+// 色相の幅も琥珀→赤の狭い範囲から、灰→白→薄黄→橙→赤→紫の6段階グラデーションに拡張し、
+// 分岐数の違いを色相でも感じ取れるようにする。少ない側（灰→白→薄黄）を追加したのは、
+// 元の黄スタートだと「分岐0の灰色」から「分岐が少しある黄色」への変化が唐突で、
+// 分岐数が少ないノード同士の違いも見分けにくかったため（2026-11-12 ユーザー指摘）。
 const GRAY = "#9ca3af";
-const AMBER = { r: 245, g: 158, b: 11 }; // amber-500
-const RED = { r: 220, g: 38, b: 38 }; // red-600
+const COLOR_STOPS: { r: number; g: number; b: number }[] = [
+	{ r: 156, g: 163, b: 175 }, // gray-400（分岐0の GRAY と同系）
+	{ r: 255, g: 255, b: 255 }, // 白
+	{ r: 254, g: 240, b: 138 }, // yellow-200（薄い黄色）
+	{ r: 250, g: 204, b: 21 }, // yellow-400
+	{ r: 249, g: 115, b: 22 }, // orange-500
+	{ r: 220, g: 38, b: 38 }, // red-600
+	{ r: 107, g: 33, b: 168 }, // purple-800
+];
 
+function interpolateStops(t: number): string {
+	const clamped = Math.min(1, Math.max(0, t));
+	const segments = COLOR_STOPS.length - 1;
+	const scaled = clamped * segments;
+	const index = Math.min(segments - 1, Math.floor(scaled));
+	const localT = scaled - index;
+	const from = COLOR_STOPS[index];
+	const to = COLOR_STOPS[index + 1];
+	const r = Math.round(from.r + (to.r - from.r) * localT);
+	const g = Math.round(from.g + (to.g - from.g) * localT);
+	const b = Math.round(from.b + (to.b - from.b) * localT);
+	return `rgb(${r}, ${g}, ${b})`;
+}
+
+// 色の基準値は表示中ノードの最大値を使う（固定上限・パーセンタイル基準はいずれも
+// 「被引用上位」のようなハブに偏った表示で色が偏ってしまい不採用、2026-11-12 実測）。
+// 固定値 1000 → 低すぎて大半がクランプされ紫一色に。固定値 200,000 → 高すぎて
+// 今度は赤～橙に偏る（表示中の分岐数レンジがどちらの固定値に対しても狭いため）。
+// 表示中の最大値を基準にすれば、その選択の中で実際に生じている分岐数のばらつきが
+// 常にスケールいっぱいに展開されるため、どの表示件数・年代レンジでも色の幅を活かせる。
 export function nodeColor(childCount: number, maxChildCount: number): string {
 	if (childCount === 0) return GRAY;
-	const t = maxChildCount > 0 ? Math.min(1, childCount / maxChildCount) : 0;
-	const r = Math.round(AMBER.r + (RED.r - AMBER.r) * t);
-	const g = Math.round(AMBER.g + (RED.g - AMBER.g) * t);
-	const b = Math.round(AMBER.b + (RED.b - AMBER.b) * t);
-	return `rgb(${r}, ${g}, ${b})`;
+	const maxLog = maxChildCount > 0 ? Math.log10(maxChildCount + 1) : 0;
+	const t = maxLog > 0 ? Math.log10(childCount + 1) / maxLog : 0;
+	return interpolateStops(t);
 }

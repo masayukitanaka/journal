@@ -42,6 +42,19 @@ export function resolveLineageIds(
 	return lineage;
 }
 
+// 選択ノード自身 + 直接の親（1ホップ、cited 側）・直接の子（1ホップ、citing 側）。
+// グラフのハイライト表示用（2026-11-12、ユーザー要望。resolveLineageIds が返す「被引用数最大の
+// 1本の祖先経路」だけでは子孫方向が含まれず分かりにくいとの指摘を受けて追加。詳細パネルの表示対象
+// （選択ノードのみ）とは独立した、ハイライト表示専用の集合）。
+export function resolveDirectNeighborIds(selectedId: number, edges: [number, number][]): Set<number> {
+	const result = new Set<number>([selectedId]);
+	for (const [cited, citing] of edges) {
+		if (citing === selectedId) result.add(cited);
+		if (cited === selectedId) result.add(citing);
+	}
+	return result;
+}
+
 // フォーカス論文の祖先・子孫（系統）をすべて辿る（SPEC.md 6.3「この系統に集中」）。
 export function resolveLineageSubtree(
 	focusId: number,
