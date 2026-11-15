@@ -148,11 +148,12 @@
 		}
 	],
 	/**
-	 * Cron Trigger — 日次 1 回、Ingest Workflow を起動する（ARCHITECT.md 3.1）。
-	 * UTC 18:00（JST 翌 3:00、深夜帯）。
+	 * Cron Trigger は無効化済み（2026-11-13）。日次実行していた worker/ingest-workflow.ts が、
+	 * 5年単位の年代分割DB（DB_REGISTRY、worker/db.ts）への移行後も旧方針の単一DB
+	 * （DB_FIELD17_2016_2026）に対して毎日 upsertPapers・upsertEdgesFromRaw・recomputeChildCnt
+	 * （WHERE句なしの全件 UPDATE）を実行し続けており、D1の Rows Written 課金が急増する事故が発生した
+	 * （実測: 24時間で4億3500万行書き込み、約$386）。復旧する場合は、まず worker/ingest-workflow.ts を
+	 * 新しい DB_REGISTRY 構成（年代ごとの DB・5年分割）に追従させてから再度有効化すること。
 	 * https://developers.cloudflare.com/workers/platform/cron-triggers
 	 */
-	"triggers": {
-		"crons": ["0 18 * * *"]
-	}
 }
